@@ -153,3 +153,5 @@ Mail is sent by hand. The dashboard does not queue or send messages.
 The scraper stays running but **idles** when today’s **located** saves (country ≠ `noloc`) reach the daily scrape cap. On the **Scraper** page, set that number and check **Apply daily cap**. Clear the checkbox to keep scraping with no daily limit. Saves tagged `noloc` still happen and do not count toward the budget.
 
 The first startup copies the previous mail-based budget into that number once. Later sender changes do not move the scrape cap.
+
+<!-- Dummy change for the quick action badge. -->
