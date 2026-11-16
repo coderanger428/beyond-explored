@@ -1,12 +1,31 @@
+import { useEffect, useState } from 'react';
 import ReactPaginate from 'react-paginate';
 import ui from '../styles/ui.module.css';
 
 export const UsersPagination = ({ page, pageCount, onPageChange }) => {
+  const [draft, setDraft] = useState(String(page));
+  useEffect(() => {
+    setDraft(String(page));
+  }, [page]);
   if (pageCount <= 1) {
     return null;
   }
+  const goToPage = (event) => {
+    event.preventDefault();
+    const value = Number.parseInt(String(draft).trim(), 10);
+    if (!Number.isFinite(value)) {
+      setDraft(String(page));
+      return;
+    }
+    const next = Math.min(pageCount, Math.max(1, value));
+    setDraft(String(next));
+    if (next !== page) {
+      onPageChange(next);
+    }
+  };
   return (
-    <ReactPaginate
+    <div className={ui['pagination-bar']}>
+      <ReactPaginate
       breakLabel="…"
       nextLabel="Next"
       previousLabel="Previous"
@@ -26,7 +45,25 @@ export const UsersPagination = ({ page, pageCount, onPageChange }) => {
       breakClassName={ui['pagination-item']}
       breakLinkClassName={ui['pagination-link']}
       activeClassName={ui['active']}
-      disabledClassName={ui['disabled']}
-    />
+        disabledClassName={ui['disabled']}
+      />
+      {pageCount > 10 ? (
+        <form className={ui['pagination-goto']} onSubmit={goToPage}>
+          <label>
+            Page
+            <input
+              type="number"
+              min={1}
+              max={pageCount}
+              inputMode="numeric"
+              aria-label="Go to page"
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+            />
+          </label>
+          <button type="submit">Go</button>
+        </form>
+      ) : null}
+    </div>
   );
 };

@@ -28,6 +28,7 @@ from core.locations import (
     add_excluded_country,
     excluded_country_slugs,
     is_skipped_country,
+    place_decision,
     suggest_places,
 )
 from core.github_enrich import (
@@ -96,11 +97,12 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Dev.to Mail Dashboard", lifespan=lifespan)
+app = FastAPI(title="Beyond Explored", lifespan=lifespan)
 
 
 class PauseBody(BaseModel):
     paused: bool
+    platform: str = "devto"
 
 
 class ScrapeCapBody(BaseModel):
@@ -129,6 +131,36 @@ class UserPatchBody(BaseModel):
     display_name: str | None = Field(default=None, max_length=app_db.DISPLAY_NAME_MAX_LEN)
     outcome: Literal["Waiting", "Replied", "Rejected"] | None = None
     location: str | None = Field(default=None, max_length=300)
+    favorite: bool | None = None
+
+
+class UserProfileBody(BaseModel):
+    display_name: str = Field(default="", max_length=app_db.DISPLAY_NAME_MAX_LEN)
+    email: str = Field(..., min_length=1, max_length=320)
+    location: str = Field(default="", max_length=300)
+    github: str = Field(default="", max_length=300)
+    socials: list[str] = Field(default_factory=list, max_length=40)
+
+
+class UserEmailBody(BaseModel):
+    email: str = Field(..., min_length=1, max_length=320)
+
+
+class UserGithubBody(BaseModel):
+    github: str = Field(default="", max_length=300)
+
+
+class SocialLinkBody(BaseModel):
+    url: str = Field(..., min_length=1, max_length=500)
+
+
+class SocialLinkReplaceBody(BaseModel):
+    previous_url: str = Field(..., min_length=1, max_length=500)
+    url: str = Field(..., min_length=1, max_length=500)
+
+
+class TelegramLinkBody(BaseModel):
+    username: str = Field(..., min_length=1, max_length=32)
 
 
 class ContactBody(BaseModel):
@@ -244,33 +276,103 @@ def _with_socials(user: dict[str, Any] | None) -> dict[str, Any] | None:
                     "url": url,
                     "status": app_db.contact_status(str(item.get("status") or "")),
                 })
-    user["socials"] = links
+    user["socials"] = app_db.dedupe_social_links(links)
     return user
 
 
-# Presence filters on users.socials JSON. Checked values are AND-ed.
-SOCIAL_ACCOUNT_FILTERS = ("linkedin", "telegram", "discord", "whatsapp")
+# Presence filters on users.socials JSON. Checked values are OR-ed.
+SOCIAL_ACCOUNT_FILTERS = (
+    "linkedin",
+    "telegram",
+    "discord",
+    "whatsapp",
+    "x",
+    "instagram",
+    "facebook",
+    "youtube",
+    "bluesky",
+    "mastodon",
+    "threads",
+    "tiktok",
+    "reddit",
+    "twitch",
+    "medium",
+    "stackoverflow",
+    "leetcode",
+    "gitlab",
+    "npm",
+    "huggingface",
+    "upwork",
+    "fiverr",
+    "freelancer",
+    "guru",
+    "peopleperhour",
+    "toptal",
+    "contra",
+    "malt",
+    "workana",
+    "other",
+)
 
 _HAS_SOCIAL_SQL = (
     "EXISTS ("
     "SELECT 1 FROM json_each("
     "CASE WHEN json_valid(socials) THEN socials ELSE '[]' END"
     ") WHERE lower(coalesce(json_extract(value, '$.provider'), '')) = ?"
+    "{status}"
     ")"
+)
+# Links whose provider is not one of the named filters. Source profiles and the
+# X alias stay out of this bucket.
+_OTHER_EXCLUDED_PROVIDERS = tuple(
+    name for name in SOCIAL_ACCOUNT_FILTERS if name != "other"
+) + ("github", "devto", "twitter")
+_HAS_OTHER_SOCIAL_SQL = (
+    "EXISTS ("
+    "SELECT 1 FROM json_each("
+    "CASE WHEN json_valid(socials) THEN socials ELSE '[]' END"
+    ") WHERE lower(coalesce(json_extract(value, '$.provider'), '')) NOT IN ("
+    + ",".join("?" for _ in _OTHER_EXCLUDED_PROVIDERS)
+    + ") AND lower(coalesce(json_extract(value, '$.provider'), '')) != ''"
+    " AND lower(coalesce(json_extract(value, '$.status'), '')) != 'failed'"
+    ")"
+)
+# A failed mark on these two is a contact you already tried. Every other
+# filter hides a failed link and keeps untouched or sent ones.
+_FAILED_STILL_INCLUDED = frozenset({"linkedin", "telegram"})
+_OPEN_STATUS_SQL = (
+    " AND lower(coalesce(json_extract(value, '$.status'), '')) != 'failed'"
 )
 
 
 def social_account_clauses(has_social: list[str] | None) -> tuple[list[str], list[Any]]:
-    """SQL fragments requiring each requested social provider to be present."""
-    wanted: list[str] = []
+    """One SQL fragment matching any requested social provider."""
     seen: set[str] = set()
+    clauses: list[str] = []
+    params: list[Any] = []
     for item in has_social or []:
         name = str(item or "").strip().lower()
         if name not in SOCIAL_ACCOUNT_FILTERS or name in seen:
             continue
         seen.add(name)
-        wanted.append(name)
-    return [_HAS_SOCIAL_SQL] * len(wanted), wanted
+        if name == "other":
+            clauses.append(_HAS_OTHER_SOCIAL_SQL)
+            params.extend(_OTHER_EXCLUDED_PROVIDERS)
+            continue
+        status = "" if name in _FAILED_STILL_INCLUDED else _OPEN_STATUS_SQL
+        clauses.append(_HAS_SOCIAL_SQL.format(status=status))
+        params.append(name)
+    if not clauses:
+        return [], []
+    return ["(" + " OR ".join(clauses) + ")"], params
+
+
+def user_search_text(value: str | None) -> str:
+    """@example_user searches for example_user. An email address stays intact."""
+    text = (value or "").strip()
+    if text.startswith("@"):
+        return text.lstrip("@").strip()
+    return text
 
 
 @app.get("/api/users")
@@ -280,13 +382,14 @@ def api_users(
     status: str | None = None,
     q: str | None = None,
     has_social: list[str] = Query(default=[]),
+    favorite: bool = False,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
 ) -> dict[str, Any]:
     where: list[str] = []
     params: list[Any] = []
     country_slug = (country or "").strip().lower()
-    query_text = (q or "").strip()
+    query_text = user_search_text(q)
     if country_slug and is_skipped_country(country_slug):
         return {
             "total": 0,
@@ -297,14 +400,6 @@ def api_users(
     if country_slug:
         where.append("country = ?")
         params.append(country_slug)
-    elif len(query_text) < 2:
-        # Global lookup is search-only so we do not dump the whole users table.
-        return {
-            "total": 0,
-            "page": page,
-            "page_size": page_size,
-            "users": [],
-        }
     else:
         skipped = sorted(excluded_country_slugs())
         if skipped:
@@ -313,6 +408,8 @@ def api_users(
             )
             params.extend(skipped)
     where.append("suppressed = 0")
+    if favorite:
+        where.append("favorite = 1")
     if status:
         where.append("mail_status = ?")
         params.append(status.strip().lower())
@@ -320,10 +417,11 @@ def api_users(
         where.append(
             "(LOWER(name) LIKE ? OR LOWER(display_name) LIKE ? "
             "OR email LIKE ? COLLATE NOCASE "
-            "OR LOWER(link) LIKE ? OR LOWER(github) LIKE ? OR LOWER(location) LIKE ?)"
+            "OR LOWER(link) LIKE ? OR LOWER(github) LIKE ? OR LOWER(location) LIKE ? "
+            "OR LOWER(COALESCE(socials, '')) LIKE ?)"
         )
         like = f"%{query_text.lower()}%"
-        params.extend([like, like, like, like, like, like])
+        params.extend([like, like, like, like, like, like, like])
     social_where, social_params = social_account_clauses(has_social)
     where.extend(social_where)
     params.extend(social_params)
@@ -342,7 +440,7 @@ def api_users(
             SELECT u.id, u.email, u.name, u.display_name, u.link, u.github, u.github_bio,
                    u.socials, u.location,
                    u.country, u.source, u.mail_status, u.social_status, u.outcome,
-                   u.created_at, u.updated_at,
+                   u.favorite, u.created_at, u.updated_at,
                    u.sender_email, u.mail_template
             FROM users u
             {clause}
@@ -361,6 +459,15 @@ def api_users(
     }
 
 
+@app.get("/api/locations/decide")
+def api_location_decide(q: str = "") -> dict[str, str]:
+    """What saving this place would do, without changing the user."""
+    try:
+        return place_decision(q)
+    except UnknownLocation as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 @app.get("/api/locations/suggest")
 def api_location_suggest(
     q: str = "",
@@ -368,11 +475,9 @@ def api_location_suggest(
 ) -> dict[str, Any]:
     with app_db.get_conn(RESULT_DIR) as conn:
         stored = app_db.distinct_locations(conn)
-        marks = app_db.suppressed_location_marks(conn)
     return {
         "suggestions": suggest_places(
             q,
-            suppressed_locations=marks,
             stored=stored,
             limit=limit,
         )
@@ -444,6 +549,18 @@ def api_mail_preview(
     }
 
 
+@app.post("/api/users/{user_id}/telegram")
+def api_user_telegram(user_id: int, body: TelegramLinkBody) -> dict[str, Any]:
+    with app_db.get_conn(RESULT_DIR) as conn:
+        try:
+            user, added = app_db.add_telegram_link(conn, user_id, body.username)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if user is None:
+            raise HTTPException(404, "User not found")
+    return {"ok": True, "added": added, "user": _with_socials(user)}
+
+
 @app.post("/api/users/{user_id}/contact")
 def api_user_contact(user_id: int, body: ContactBody) -> dict[str, Any]:
     with app_db.get_conn(RESULT_DIR) as conn:
@@ -462,6 +579,88 @@ def api_user_contact(user_id: int, body: ContactBody) -> dict[str, Any]:
         if user is None:
             raise HTTPException(404, "User not found")
     return {"ok": True, "user": _with_socials(user)}
+
+
+@app.put("/api/users/{user_id}/profile")
+def api_user_profile(user_id: int, body: UserProfileBody) -> dict[str, Any]:
+    with app_db.get_conn(RESULT_DIR) as conn:
+        try:
+            result = app_db.update_user_profile(
+                conn,
+                user_id,
+                display_name=body.display_name,
+                email=body.email,
+                location=body.location,
+                github=body.github,
+                socials=body.socials,
+            )
+        except UnknownLocation as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if result is None:
+            raise HTTPException(404, "User not found")
+    if result["action"] == "delete":
+        return {
+            "ok": True,
+            "action": "delete",
+            "user": None,
+            "location": result["location"],
+            "country": result["country"],
+        }
+    return {"ok": True, "action": "save", "user": _with_socials(result["user"])}
+
+
+def _profile_edit(user_id: int, edit) -> dict[str, Any]:
+    with app_db.get_conn(RESULT_DIR) as conn:
+        try:
+            user = edit(conn)
+        except UnknownLocation as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if user is None:
+            raise HTTPException(404, "User not found")
+    return {"ok": True, "user": _with_socials(user)}
+
+
+@app.patch("/api/users/{user_id}/email")
+def api_user_email(user_id: int, body: UserEmailBody) -> dict[str, Any]:
+    return _profile_edit(user_id, lambda conn: app_db.update_user_email(conn, user_id, body.email))
+
+
+@app.patch("/api/users/{user_id}/github")
+def api_user_github(user_id: int, body: UserGithubBody) -> dict[str, Any]:
+    return _profile_edit(
+        user_id,
+        lambda conn: app_db.update_user_github_login(conn, user_id, body.github),
+    )
+
+
+@app.post("/api/users/{user_id}/socials")
+def api_user_social_add(user_id: int, body: SocialLinkBody) -> dict[str, Any]:
+    return _profile_edit(user_id, lambda conn: app_db.add_user_social_link(conn, user_id, body.url))
+
+
+@app.patch("/api/users/{user_id}/socials")
+def api_user_social_replace(user_id: int, body: SocialLinkReplaceBody) -> dict[str, Any]:
+    return _profile_edit(
+        user_id,
+        lambda conn: app_db.replace_user_social_link(
+            conn,
+            user_id,
+            body.previous_url,
+            body.url,
+        ),
+    )
+
+
+@app.post("/api/users/{user_id}/socials/remove")
+def api_user_social_remove(user_id: int, body: SocialLinkBody) -> dict[str, Any]:
+    return _profile_edit(
+        user_id,
+        lambda conn: app_db.remove_user_social_link(conn, user_id, body.url),
+    )
 
 
 @app.patch("/api/users/{user_id}")
@@ -499,6 +698,10 @@ def api_user_patch(user_id: int, body: UserPatchBody) -> dict[str, Any]:
                 raise HTTPException(400, str(exc)) from exc
             if user is None:
                 raise HTTPException(404, "User not found")
+        if "favorite" in fields:
+            user = _with_socials(app_db.set_user_favorite(conn, user_id, bool(body.favorite)))
+            if user is None:
+                raise HTTPException(404, "User not found")
     return {"ok": True, "user": user}
 
 
@@ -511,21 +714,32 @@ def api_user_suppress(user_id: int) -> dict[str, Any]:
     return {"ok": True}
 
 
-def _scraper_payload(conn) -> dict[str, Any]:
+def _scraper_platform(value: str | None) -> str:
+    platform = (value or "devto").strip().lower()
+    if platform not in {"devto", "github"}:
+        raise HTTPException(404, "Unknown scraper.")
+    return platform
+
+
+def _scraper_payload(conn, platform: str = "devto") -> dict[str, Any]:
+    if platform == "github":
+        return app_db.github_scrape_snapshot(conn)
     return app_db.scrape_control_snapshot(conn)
 
 
 @app.get("/api/scraper")
-def api_scraper() -> dict[str, Any]:
+def api_scraper(platform: str = "devto") -> dict[str, Any]:
+    name = _scraper_platform(platform)
     with app_db.get_conn(RESULT_DIR) as conn:
-        return _scraper_payload(conn)
+        return _scraper_payload(conn, name)
 
 
 @app.post("/api/scraper/pause")
 def api_scraper_pause(body: PauseBody) -> dict[str, Any]:
+    name = _scraper_platform(body.platform)
     with app_db.get_conn(RESULT_DIR) as conn:
-        app_db.set_scrape_paused(conn, body.paused)
-        return {"ok": True, "scraper": _scraper_payload(conn)}
+        app_db.set_scrape_paused(conn, body.paused, name)
+        return {"ok": True, "scraper": _scraper_payload(conn, name)}
 
 
 @app.put("/api/scraper/cap")
@@ -550,19 +764,19 @@ def _require_github_token(value: str) -> str:
     return token
 
 
-def _store_github_check(conn, result: dict[str, str]) -> None:
-    app_db.set_meta(conn, "github_token_status", result["status"])
+def _store_github_check(conn, result: dict[str, str], *, key: str = "github_token") -> None:
+    app_db.set_meta(conn, f"{key}_status", result["status"])
     app_db.set_meta(
         conn,
-        "github_token_checked_at",
+        f"{key}_checked_at",
         datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
     )
     if result["status"] != "unreachable":
-        app_db.set_meta(conn, "github_token_expires_at", result.get("expires_at") or "")
+        app_db.set_meta(conn, f"{key}_expires_at", result.get("expires_at") or "")
 
 
-def _refresh_github_token(conn, token: str) -> None:
-    _store_github_check(conn, inspect_github_token(token))
+def _refresh_github_token(conn, token: str, *, key: str = "github_token") -> None:
+    _store_github_check(conn, inspect_github_token(token), key=key)
 
 
 def _reject_github_token(status: str, *, had_token: bool) -> str:
@@ -581,8 +795,10 @@ def _reject_github_token(status: str, *, had_token: bool) -> str:
     return reason + kept
 
 
-def _github_token_view(conn, *, refresh: bool = False) -> dict[str, Any]:
-    token = app_db.get_meta(conn, "github_token", "").strip()
+def _github_token_view(
+    conn, *, refresh: bool = False, key: str = "github_token"
+) -> dict[str, Any]:
+    token = app_db.get_meta(conn, key, "").strip()
     if not token:
         return {
             "configured": False,
@@ -593,7 +809,7 @@ def _github_token_view(conn, *, refresh: bool = False) -> dict[str, Any]:
             "expired": False,
             "checked_at": "",
         }
-    checked_raw = app_db.get_meta(conn, "github_token_checked_at", "")
+    checked_raw = app_db.get_meta(conn, f"{key}_checked_at", "")
     stale = True
     if checked_raw and not refresh:
         try:
@@ -605,9 +821,9 @@ def _github_token_view(conn, *, refresh: bool = False) -> dict[str, Any]:
                 checked = checked.replace(tzinfo=timezone.utc)
             stale = datetime.now(timezone.utc) - checked > GITHUB_TOKEN_CHECK_TTL
     if stale:
-        _refresh_github_token(conn, token)
-    status = app_db.get_meta(conn, "github_token_status", "") or "unreachable"
-    expires_at = app_db.get_meta(conn, "github_token_expires_at", "")
+        _refresh_github_token(conn, token, key=key)
+    status = app_db.get_meta(conn, f"{key}_status", "") or "unreachable"
+    expires_at = app_db.get_meta(conn, f"{key}_expires_at", "")
     return {
         "configured": True,
         "masked": mask_token(token),
@@ -616,7 +832,7 @@ def _github_token_view(conn, *, refresh: bool = False) -> dict[str, Any]:
         "expires_label": format_expiration_label(expires_at),
         "expired": status == "expired",
         "expires_soon": status == "ok" and token_expires_soon(expires_at),
-        "checked_at": app_db.get_meta(conn, "github_token_checked_at", ""),
+        "checked_at": app_db.get_meta(conn, f"{key}_checked_at", ""),
     }
 
 
@@ -646,6 +862,37 @@ def api_github_token_check() -> dict[str, Any]:
         if not app_db.get_meta(conn, "github_token", "").strip():
             raise HTTPException(400, "No GitHub token is saved.")
         return _github_token_view(conn, refresh=True)
+
+
+SCRAPE_TOKEN_KEY = "github_scrape_token"
+
+
+@app.get("/api/github-scrape-token")
+def api_github_scrape_token() -> dict[str, Any]:
+    with app_db.get_conn(RESULT_DIR) as conn:
+        return _github_token_view(conn, key=SCRAPE_TOKEN_KEY)
+
+
+@app.post("/api/github-scrape-token")
+def api_github_scrape_token_save(body: GithubTokenBody) -> dict[str, Any]:
+    token = _require_github_token(body.token)
+    result = inspect_github_token(token)
+    if not github_token_accepted(result["status"]):
+        with app_db.get_conn(RESULT_DIR) as conn:
+            had_token = bool(app_db.get_meta(conn, SCRAPE_TOKEN_KEY, "").strip())
+        raise HTTPException(400, _reject_github_token(result["status"], had_token=had_token))
+    with app_db.get_conn(RESULT_DIR) as conn:
+        app_db.set_meta(conn, SCRAPE_TOKEN_KEY, token)
+        _store_github_check(conn, result, key=SCRAPE_TOKEN_KEY)
+        return _github_token_view(conn, key=SCRAPE_TOKEN_KEY)
+
+
+@app.post("/api/github-scrape-token/check")
+def api_github_scrape_token_check() -> dict[str, Any]:
+    with app_db.get_conn(RESULT_DIR) as conn:
+        if not app_db.get_meta(conn, SCRAPE_TOKEN_KEY, "").strip():
+            raise HTTPException(400, "No GitHub scraper token is saved.")
+        return _github_token_view(conn, refresh=True, key=SCRAPE_TOKEN_KEY)
 
 
 @app.delete("/api/github-token")

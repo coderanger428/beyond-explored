@@ -19,14 +19,16 @@ import requests
 
 import core.db as app_db
 from core.github_enrich import (
-    build_social_links,
-    fetch_json,
+    combine_social_links,
+    fetch_profile_readme,
     github_token,
-    place_from_text,
-    profile_bio,
-    profile_location,
-    profile_name,
-    social_accounts_path,
+    links_from_text,
+    REQUEST_DELAY_SEC as GITHUB_REQUEST_DELAY_SEC,
+)
+from core.github_lookup import (
+    apply_github_place,
+    investigate_github_user,
+    save_github_contact,
 )
 from core.locations import detect_country, format_place, is_skipped_country
 
@@ -36,6 +38,8 @@ API_USER_BY_ID = f"{DEVTO_BASE}/api/users"
 RESULT_DIR = app_db.PROJECT_ROOT
 INITIAL_USER_ID = 1
 REQUEST_DELAY_SEC = 1.0
+# A dropped network stays on the same Dev.to id. 404 still moves on.
+NETWORK_RETRY_SEC = 15.0
 # Idle poll while paused or waiting for the next Tokyo day after hitting the save cap.
 # Keep this well under SCRAPE_HEARTBEAT_STALE_SEC so the dashboard stays "alive".
 SCRAPE_IDLE_POLL_SEC = 5.0
@@ -107,82 +111,33 @@ def current_scrape_budget(conn) -> tuple[str, int, int | None]:
     return day, saved_today, limit
 
 
-def fetch_user(user_id: int) -> dict | None:
-    try:
-        url = f"{API_USER_BY_ID}/{user_id}"
-        response = requests.get(url, headers=HEADERS, timeout=20)
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        print(f"Error fetching dev.to user {user_id}: {e}")
-        return None
+def fetch_user(user_id: int) -> tuple[str, dict | None]:
+    """Return (ok|missing|retry, user).
 
-
-def fetch_github_user(username: str) -> dict | None:
-    global _GITHUB_AUTH_WARNING_EMITTED
-
-    normalized = normalize_github_username(username)
-    if not normalized:
-        print(f"Skipping invalid GitHub username: {username!r}")
-        return None
-    try:
-        token = github_token()
-        if not token:
-            raise ValueError(
-                "GitHub token is not set. Add it on the dashboard Settings page."
-            )
-        url = f"https://api.github.com/users/{normalized}"
-        headers = {
-            "Authorization": f"token {token}",
-            "User-Agent": "scraping_dev_bot/1.0",
-        }
-        response = requests.get(url, headers=headers, timeout=20)
-        if response.status_code == 401:
-            if not _GITHUB_AUTH_WARNING_EMITTED:
-                print(
-                    "GitHub API auth failed (401): the token on the Settings page is invalid "
-                    "or expired. Skipping GitHub lookups for now."
-                )
-                _GITHUB_AUTH_WARNING_EMITTED = True
-            return None
-        if response.status_code == 404:
-            return None
-        response.raise_for_status()
-        return response.json()
-    except Exception as e:
-        if "401" not in str(e) and "Unauthorized" not in str(e):
-            print(f"Error fetching GitHub user {normalized}: {e}")
-        return None
-
-
-def _store_github_profile(
-    conn,
-    user_id: int,
-    github_username: str,
-    github_data: dict,
-) -> None:
-    """Keep bio, display name, and listed social links from a profile already fetched.
-
-    The social-accounts call runs only for users who will be saved. A failed call
-    leaves socials unset so a later pass can retry.
+    missing is a real 404 and the walk moves on. retry is a network or server
+    failure, and the same id is fetched again.
     """
-    time.sleep(REQUEST_DELAY_SEC)
-    status, payload = fetch_json(requests.Session(), social_accounts_path(github_username))
-    accounts = None
-    if status == "ok" and isinstance(payload, list):
-        accounts = payload
-    elif status == "missing":
-        accounts = []
-    app_db.update_github_profile(
-        conn,
-        user_id,
-        bio=profile_bio(github_data),
-        github_name=profile_name(github_data),
-        socials=None if accounts is None else build_social_links(github_data, accounts),
-        github_location=profile_location(github_data),
-    )
+    url = f"{API_USER_BY_ID}/{user_id}"
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=20)
+    except requests.RequestException as exc:
+        print(f"Error fetching dev.to user {user_id}: {exc}")
+        return "retry", None
+    if response.status_code == 404:
+        return "missing", None
+    if response.status_code in {408, 429} or response.status_code >= 500:
+        print(f"Error fetching dev.to user {user_id}: HTTP {response.status_code}")
+        return "retry", None
+    try:
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        print(f"Error fetching dev.to user {user_id}: {exc}")
+        return "retry", None
+    if not isinstance(payload, dict):
+        print(f"Error fetching dev.to user {user_id}: response was not a user")
+        return "retry", None
+    return "ok", payload
 
 
 def normalize_github_username(raw: str) -> str:
@@ -276,9 +231,9 @@ def main() -> None:
         return
 
     if not github_token():
-        raise ValueError(
-            "GitHub token is not set. Add it on the dashboard Settings page."
-        )
+            raise ValueError(
+                "GitHub token is not set. Add it on the dev.to scraper page."
+            )
 
     with app_db.get_conn(result_dir) as conn:
         state = app_db.get_scrape_state(conn, SOURCE)
@@ -384,53 +339,120 @@ def main() -> None:
                 wait_reason = ""
 
             print(f"Processing user ID {user_id}...")
+            hold_user = False
+            retry_seconds = 0.0
             try:
-                user = fetch_user(user_id)
-                if user:
-                    location = user.get("location")
-                    country = country_slug(detect_country(location))
-                    if is_skipped_country(country):
-                        print(f"  skip blocked country: {country}")
-                    else:
-                        save_location = "" if country == "noloc" else format_place(location, country)
-                        github_username = (user.get("github_username") or "").strip()
-                        github_username = normalize_github_username(github_username)
-
-                        if github_username:
-                            github_data = fetch_github_user(github_username)
-                            gmail = (
-                                (github_data.get("email") or "").strip()
-                                if github_data
-                                else ""
+                fetch_state, user = fetch_user(user_id)
+                if fetch_state == "retry":
+                    print(f"  network error, retrying user ID {user_id}")
+                    hold_user = True
+                    retry_seconds = NETWORK_RETRY_SEC
+                elif user:
+                    github_username = normalize_github_username(
+                        (user.get("github_username") or "").strip()
+                    )
+                    stored = (
+                        app_db.peek_user_by_github(conn, github_username)
+                        if github_username
+                        else None
+                    )
+                    if stored is not None:
+                        time.sleep(GITHUB_REQUEST_DELAY_SEC)
+                        readme_status, readme_text, readme_wait = fetch_profile_readme(
+                            requests.Session(),
+                            github_username,
+                            token=github_token(),
+                        )
+                        if readme_status == "rate_limited":
+                            print(f"  GitHub rate limit, waiting {int(readme_wait)}s")
+                            hold_user = True
+                            retry_seconds = readme_wait
+                        elif readme_status == "failed":
+                            print(f"  GitHub network error, retrying user ID {user_id}")
+                            hold_user = True
+                            retry_seconds = NETWORK_RETRY_SEC
+                        elif readme_status == "unauthorized":
+                            if not _GITHUB_AUTH_WARNING_EMITTED:
+                                print(
+                                    "GitHub API auth failed (401): the token on the "
+                                    "dev.to scraper page is invalid or expired. "
+                                    "Skipping GitHub lookups for now."
+                                )
+                                _GITHUB_AUTH_WARNING_EMITTED = True
+                            added = app_db.append_social_links(
+                                conn,
+                                int(stored["id"]),
+                                links_from_text(stored["github_bio"]),
                             )
-                            if gmail:
-                                if country == "noloc":
-                                    placed = place_from_text(profile_location(github_data))
-                                    if placed.skipped:
-                                        print(f"  skip blocked country: {placed.country}")
-                                        gmail = ""
-                                    elif placed.country != "noloc":
-                                        country = placed.country
-                                        save_location = placed.location
-                            if gmail:
+                            app_db.clear_github_bio(conn, int(stored["id"]))
+                            conn.commit()
+                            extra = f", {added} from bio" if added else ""
+                            print(f"  skip saved user: {github_username}{extra}")
+                        else:
+                            added = app_db.append_social_links(
+                                conn,
+                                int(stored["id"]),
+                                combine_social_links(
+                                    links_from_text(stored["github_bio"]),
+                                    readme_text,
+                                ),
+                            )
+                            app_db.clear_github_bio(conn, int(stored["id"]))
+                            conn.commit()
+                            extra = f", {added} from bio and readme" if added else ""
+                            print(f"  skip saved user: {github_username}{extra}")
+                    else:
+                        location = user.get("location")
+                        country = country_slug(detect_country(location))
+                        if is_skipped_country(country):
+                            print(f"  skip blocked country: {country}")
+                        elif github_username:
+                            save_location = "" if country == "noloc" else format_place(location, country)
+                            person = investigate_github_user(
+                                requests.Session(),
+                                github_username,
+                                github_token(),
+                            )
+                            if person.status == "rate_limited":
+                                print(
+                                    f"  GitHub rate limit, waiting {int(person.wait_seconds)}s"
+                                )
+                                hold_user = True
+                                retry_seconds = person.wait_seconds
+                            elif person.status in {"failed", "retry"}:
+                                print(f"  GitHub network error, retrying user ID {user_id}")
+                                hold_user = True
+                                retry_seconds = NETWORK_RETRY_SEC
+                            elif person.status == "unauthorized":
+                                if not _GITHUB_AUTH_WARNING_EMITTED:
+                                    print(
+                                        "GitHub API auth failed (401): the token on the "
+                                        "dev.to scraper page is invalid or expired. "
+                                        "Skipping GitHub lookups for now."
+                                    )
+                                    _GITHUB_AUTH_WARNING_EMITTED = True
+                            elif person.status == "ok" and person.email:
                                 name = user.get("name") or ""
                                 username = user.get("username") or ""
-                                site_link = f"{DEVTO_BASE}/{username}"
-                                inserted, _uid = app_db.insert_user(
+                                outcome = save_github_contact(
                                     conn,
-                                    email=gmail,
-                                    name=name,
-                                    link=site_link,
-                                    github=github_username,
-                                    location=save_location,
-                                    country=country,
+                                    person,
                                     source=SOURCE,
+                                    link=f"{DEVTO_BASE}/{username}",
                                     platform_user_id=user_id,
+                                    prior_country=country,
+                                    prior_location=save_location,
+                                    name=name,
                                 )
-                                if _uid is not None:
-                                    _store_github_profile(conn, _uid, github_username, github_data)
                                 conn.commit()
-                                if inserted:
+                                if outcome == "skipped":
+                                    print("  skip blocked country")
+                                elif outcome == "noloc":
+                                    print("  skip no location")
+                                elif outcome == "saved":
+                                    country, save_location, _blocked = apply_github_place(
+                                        country, save_location, person.location
+                                    )
                                     saved_this_run += 1
                                     if country != "noloc":
                                         saved_today += 1
@@ -447,12 +469,20 @@ def main() -> None:
                                         f"[{country}={ccount}, total={state['total_saved']}, "
                                         f"located_today={_budget_text(saved_today, save_limit)}]"
                                     )
-                                else:
-                                    print(f"  skip duplicate email: {gmail}")
+                                elif outcome == "duplicate":
+                                    print(f"  skip duplicate: {person.login}")
             finally:
-                app_db.advance_last_id(conn, user_id, SOURCE)
-                conn.commit()
-                state = app_db.get_scrape_state(conn, SOURCE)
+                if not hold_user:
+                    app_db.advance_last_id(conn, user_id, SOURCE)
+                    conn.commit()
+                    state = app_db.get_scrape_state(conn, SOURCE)
+
+            if hold_user:
+                deadline = time.monotonic() + max(1.0, retry_seconds)
+                while time.monotonic() < deadline:
+                    poll_scrape_control(conn)
+                    time.sleep(SCRAPE_IDLE_POLL_SEC)
+                continue
 
             user_id += 1
             time.sleep(REQUEST_DELAY_SEC)

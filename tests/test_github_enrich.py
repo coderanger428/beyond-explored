@@ -1,18 +1,22 @@
+import base64
 import json
 import sqlite3
 import unittest
-
-import core.db as db
 from datetime import datetime, timezone
 
+import core.db as db
 from core.github_enrich import (
+    classify_provider,
     adopted_names,
     build_social_links,
+    combine_social_links,
     format_expiration_label,
     github_token_accepted,
     github_token_health,
+    links_from_text,
     parse_github_expiration,
     place_from_text,
+    readme_markdown,
     should_adopt_github_name,
     token_expires_soon,
 )
@@ -60,6 +64,7 @@ class SocialLinkTests(unittest.TestCase):
                 {"provider": "generic", "url": "https://github.com/ada"},
                 {"provider": "generic", "url": "https://discord.gg/abc"},
                 {"provider": "generic", "url": "https://t.me/ada"},
+                {"provider": "generic", "url": "https://t.me/ada_bot"},
                 {"provider": "generic", "url": "https://stackoverflow.com/users/1/ada"},
                 {"provider": "generic", "url": "https://pt.stackoverflow.com/users/2/ada"},
                 {"provider": "generic", "url": "https://bsky.app/profile/ada"},
@@ -73,9 +78,65 @@ class SocialLinkTests(unittest.TestCase):
                 {"provider": "linkedin", "url": "https://linkedin.com/in/ada", "status": "not_sent"},
                 {"provider": "discord", "url": "https://discord.gg/abc", "status": "not_sent"},
                 {"provider": "telegram", "url": "https://t.me/ada", "status": "not_sent"},
+                {"provider": "telegram", "url": "https://t.me/ada_bot", "status": "not_sent"},
                 {"provider": "stackoverflow", "url": "https://stackoverflow.com/users/1/ada", "status": "not_sent"},
                 {"provider": "stackoverflow", "url": "https://pt.stackoverflow.com/users/2/ada", "status": "not_sent"},
                 {"provider": "bluesky", "url": "https://bsky.app/profile/ada", "status": "not_sent"},
+            ],
+        )
+
+    def test_bio_and_website_add_known_sites_only(self):
+        self.assertEqual(
+            links_from_text("Reach me at https://t.me/ada, or https://example.com/ada."),
+            [{"provider": "telegram", "url": "https://t.me/ada", "status": "not_sent"}],
+        )
+        self.assertEqual(
+            links_from_text("telegram: t.me/bochapast"),
+            [{"provider": "telegram", "url": "https://t.me/bochapast", "status": "not_sent"}],
+        )
+        self.assertEqual(
+            links_from_text("see https://[::1 and https://t.me/ada"),
+            [{"provider": "telegram", "url": "https://t.me/ada", "status": "not_sent"}],
+        )
+        links = build_social_links(
+            {
+                "twitter_username": "",
+                "bio": "https://www.linkedin.com/in/ada",
+                "blog": "https://ada.github.io",
+            },
+            [],
+        )
+        self.assertEqual(
+            links,
+            [{"provider": "linkedin", "url": "https://www.linkedin.com/in/ada", "status": "not_sent"}],
+        )
+
+    def test_readme_adds_a_contact_missing_from_the_profile(self):
+        raw = base64.b64encode(b"# Ada\n\nTelegram: https://t.me/ada\n").decode()
+        wrapped = "\n".join(raw[i:i + 60] for i in range(0, len(raw), 60))
+        self.assertIn("https://t.me/ada", readme_markdown({"encoding": "base64", "content": wrapped}))
+        links = combine_social_links(
+            [{"provider": "x", "url": "https://x.com/ada", "status": "not_sent"}],
+            "https://t.me/ada and https://ada.github.io",
+        )
+        self.assertEqual(
+            links,
+            [
+                {"provider": "x", "url": "https://x.com/ada", "status": "not_sent"},
+                {"provider": "telegram", "url": "https://t.me/ada", "status": "not_sent"},
+            ],
+        )
+        self.assertEqual(combine_social_links(links, "https://t.me/ada"), links)
+
+    def test_freelance_marketplaces_are_known_sites(self):
+        self.assertEqual(classify_provider("generic", "https://www.fiverr.com/ada"), "fiverr")
+        self.assertEqual(classify_provider("", "https://www.freelancer.com/u/ada"), "freelancer")
+        self.assertEqual(classify_provider("", "https://www.guru.com/freelancers/ada"), "guru")
+        self.assertEqual(
+            links_from_text("hire me https://www.fiverr.com/ada and https://guru.com/freelancers/ada"),
+            [
+                {"provider": "fiverr", "url": "https://www.fiverr.com/ada", "status": "not_sent"},
+                {"provider": "guru", "url": "https://guru.com/freelancers/ada", "status": "not_sent"},
             ],
         )
 
@@ -109,7 +170,7 @@ class ProfileStoreTests(unittest.TestCase):
             row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             self.assertEqual(row["name"], "Merzoug Imad-eddine")
             self.assertEqual(row["display_name"], "Merzoug Imad-eddine")
-            self.assertEqual(row["github_bio"], "builder")
+            self.assertEqual(row["github_bio"], "")
             self.assertEqual(json.loads(row["socials"]), [])
             self.assertEqual(row["updated_at"], before)
             self.assertEqual(row["link"], "https://dev.to/serinir")

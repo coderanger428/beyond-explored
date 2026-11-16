@@ -81,6 +81,14 @@
   text-transform: none;
 }
 
+.pagination-bar {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+}
+
 .pagination {
   display: flex;
   flex-wrap: wrap;
@@ -90,6 +98,37 @@
   margin: 12px 0;
   padding: 0;
   list-style: none;
+}
+
+.pagination-goto {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.pagination-goto label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.pagination-goto input {
+  width: 76px;
+  height: 36px;
+  margin: 0;
+  padding: 0 8px;
+  border: 1px solid #c4d0dc;
+  border-radius: 10px;
+  background: #f8fafc;
+  color: #1f2937;
+  font: inherit;
+  font-weight: 600;
+}
+
+.pagination-goto button {
+  height: 36px;
+  padding: 0 14px;
 }
 
 .pagination-item {

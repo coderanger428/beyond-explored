@@ -4,6 +4,9 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
+
+import requests
 
 import core.db as db
 import scrapers.devto.scrape as main
@@ -285,6 +288,27 @@ class ScraperParameterTests(unittest.TestCase):
             self.assertEqual(db.get_scraper_parameter(conn, "devto")["last_id"], 12)
         finally:
             conn.close()
+
+
+class DevtoFetchTests(unittest.TestCase):
+    @patch("scrapers.devto.scrape.requests.get")
+    def test_timeout_stays_on_the_same_id(self, get):
+        get.side_effect = requests.Timeout("timed out")
+        self.assertEqual(main.fetch_user(428222), ("retry", None))
+
+    @patch("scrapers.devto.scrape.requests.get")
+    def test_missing_user_moves_on(self, get):
+        response = requests.Response()
+        response.status_code = 404
+        get.return_value = response
+        self.assertEqual(main.fetch_user(428222), ("missing", None))
+
+    @patch("scrapers.devto.scrape.requests.get")
+    def test_server_error_stays_on_the_same_id(self, get):
+        response = requests.Response()
+        response.status_code = 502
+        get.return_value = response
+        self.assertEqual(main.fetch_user(428222), ("retry", None))
 
 
 if __name__ == "__main__":

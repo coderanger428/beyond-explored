@@ -67,21 +67,21 @@ class PlaceDecisionTests(unittest.TestCase):
         )
         self.assertEqual(
             place_decision("United Arab Emirates"),
-            {"location": "UAE", "country": "uae", "action": "save"},
+            {"location": "UAE", "country": "uae", "action": "delete"},
         )
         excluded = place_decision("Seoul, South Korea")
         self.assertEqual(excluded["location"], "Seoul, KOR")
         self.assertEqual(excluded["country"], "south_korea")
         self.assertEqual(excluded["action"], "delete")
 
-    def test_marked_location_suppresses(self):
-        decision = place_decision(
-            "Berlin, Germany",
-            suppressed_locations={"Berlin, DEU"},
-        )
-        self.assertEqual(decision["action"], "suppress")
+    def test_a_city_stays_a_normal_save(self):
+        decision = place_decision("Berlin, Germany")
+        self.assertEqual(decision["action"], "save")
         self.assertEqual(decision["location"], "Berlin, DEU")
         self.assertEqual(decision["country"], "germany")
+        decision = place_decision("New York")
+        self.assertEqual(decision["action"], "save")
+        self.assertEqual(decision["location"], "New York, NY")
 
 
 class SuggestPlacesTests(unittest.TestCase):
@@ -109,16 +109,15 @@ class SuggestPlacesTests(unittest.TestCase):
         self.assertIn("Berlin, DEU", stored)
         self.assertEqual(suggest_places("berlin", stored=[{"location": "Berlin, DEU", "country": "germany"}])[0]["location"], "Berlin, DEU")
 
-    def test_excluded_and_suppressed_marks(self):
+    def test_excluded_country_is_marked_delete(self):
         excluded = suggest_places("south korea")[0]
         self.assertEqual(excluded["location"], "KOR")
         self.assertEqual(excluded["action"], "delete")
-        suppressed = suggest_places(
+        city = suggest_places(
             "berlin",
-            suppressed_locations={"Berlin, DEU"},
             stored=[{"location": "Berlin, DEU", "country": "germany"}],
         )[0]
-        self.assertEqual(suppressed["action"], "suppress")
+        self.assertEqual(city["action"], "save")
 
 
 if __name__ == "__main__":

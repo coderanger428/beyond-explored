@@ -1,4 +1,5 @@
 import { DailyCapProgress } from '../../components/DailyCapProgress';
+import { ScraperToken } from './ScraperToken';
 import { useDashboard } from '../../app/DashboardContext';
 import { SCRAPER_STATUS_LABELS } from '../../lib/format';
 import { SCRAPERS } from '../../lib/source';
@@ -113,16 +114,25 @@ export function ScraperView() {
                       </div>
                     </div>
                     <div className={cls(ui, "status-stat")}>
-                      <strong>Last Dev.to ID</strong>
+                      <strong>{selectedScraper === 'github' ? 'Last GitHub ID' : 'Last Dev.to ID'}</strong>
                       <div className={cls(ui, "status-stat-value")}>{scraperInfo.last_id ?? 0}</div>
                     </div>
                     <div className={cls(ui, "status-stat")}>
-                      <strong>Users saved</strong>
+                      <strong>{selectedScraper === 'github' ? 'Accounts saved' : 'Users saved'}</strong>
                       <div className={cls(ui, "status-stat-value")}>{scraperInfo.total_users ?? 0}</div>
                     </div>
+                    {selectedScraper === 'github' ? (
+                      <div className={cls(ui, "status-stat")}>
+                        <strong>In pool</strong>
+                        <div className={cls(ui, "status-stat-value")}>{scraperInfo.pool_size ?? 0}</div>
+                      </div>
+                    ) : null}
                   </div>
                 </div>
 
+                <ScraperToken kind={selectedScraper === 'github' ? 'scrape' : 'lookup'} />
+
+                {selectedScraper === 'github' ? null : (
                 <div className={cls(ui, "section-block")}>
                   <div className={cls(ui, "section-header")}>
                     <h3>Daily scrape cap</h3>
@@ -178,6 +188,7 @@ export function ScraperView() {
                     </div>
                   </div>
                 </div>
+                )}
               </>
             )}
           </section>

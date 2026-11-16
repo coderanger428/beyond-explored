@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_FILENAME = "app.db"
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS users (
     mail_template TEXT NOT NULL DEFAULT '',
     outcome TEXT NOT NULL DEFAULT 'Waiting',
     suppressed INTEGER NOT NULL DEFAULT 0,
+    favorite INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(email)
@@ -59,11 +62,6 @@ CREATE INDEX IF NOT EXISTS idx_users_mail_status ON users(mail_status);
 CREATE INDEX IF NOT EXISTS idx_users_name ON users(name);
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_location ON users(location);
-
-CREATE TABLE IF NOT EXISTS suppressed_locations (
-    location TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL
-);
 
 CREATE TABLE IF NOT EXISTS scraper_parameter (
     platform_id TEXT PRIMARY KEY,
@@ -111,6 +109,14 @@ CREATE TABLE IF NOT EXISTS mail_templates (
     subject TEXT NOT NULL,
     body TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS github_accounts (
+    github_id INTEGER PRIMARY KEY,
+    login TEXT NOT NULL,
+    account_type TEXT NOT NULL,
+    html_url TEXT NOT NULL,
+    scraped_at TEXT NOT NULL
 );
 """
 
@@ -232,12 +238,17 @@ def init_db(result_dir: Path | None = None) -> Path:
         ensure_static_scrape_cap(conn)
         drop_unused_outcome_columns(conn)
         ensure_suppressed_column(conn)
+        ensure_favorite_column(conn)
         ensure_suppressed_locations(conn)
         ensure_manual_contact(conn)
         ensure_social_link_status(conn)
         ensure_social_provider_names(conn)
+        ensure_refresh_social_provider_names(conn)
         ensure_drop_source_socials(conn)
+        ensure_one_social_per_user(conn)
+        ensure_drop_noloc_without_socials(conn)
         ensure_scraper_parameters(conn)
+        ensure_github_accounts(conn)
         ensure_mail_sender_name(conn)
         reset_mail_state_to_pending(conn)
         conn.commit()
@@ -299,6 +310,15 @@ def ensure_user_source_columns(conn: sqlite3.Connection) -> None:
     )
 
 
+def source_origin(source: str | None) -> str:
+    """The scraper that first owned the row. A later ',github' tag is not the origin."""
+    for item in (source or "").split(","):
+        name = item.strip().lower()
+        if name:
+            return name
+    return ""
+
+
 def compose_source(source: str, github: str = "") -> str:
     """Origin platform, plus github when that account is stored."""
     parts: list[str] = []
@@ -352,11 +372,62 @@ def ensure_suppressed_column(conn: sqlite3.Connection) -> None:
     )
 
 
+def ensure_favorite_column(conn: sqlite3.Connection) -> None:
+    """Heart flag on a user. Existing rows start unfavorited."""
+    if "favorite" not in _user_columns(conn):
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0"
+        )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_users_favorite ON users(favorite)")
+
+
 CONTACT_STATUSES = ("not_sent", "sent", "failed")
 
 
 def social_url_key(url: str) -> str:
-    return (url or "").strip().rstrip("/").lower()
+    """Identity of one social link on a user. A repeated link compares equal.
+
+    Several Telegrams stay. The same Telegram username does not, including
+    http and https, letter case, t.me and telegram.me, and a sticker link
+    that repeats the username.
+    """
+    text = (url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return text.rstrip("/").lower()
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if parsed.scheme not in {"http", "https"} or not host:
+        return text.rstrip("/").lower()
+    segments = [part for part in (parsed.path or "").split("/") if part]
+    telegram = _telegram_username(host, segments)
+    if telegram:
+        return "https://t.me/" + telegram
+    if host in {"twitter.com", "mobile.twitter.com", "mobile.x.com"}:
+        host = "x.com"
+    path = "/" + "/".join(segments) if segments else ""
+    return f"https://{host}{path}".rstrip("/").lower()
+
+
+def _telegram_username(host: str, segments: list[str]) -> str:
+    if host.endswith(".t.me") and host != "t.me":
+        label = host[: -len(".t.me")]
+        if label and label != "www":
+            return label.lower()
+    if host not in {"t.me", "telegram.me", "telegram.org"}:
+        return ""
+    parts = list(segments)
+    if parts and parts[0].lower() == "s" and len(parts) > 1:
+        parts = parts[1:]
+    if len(parts) >= 2 and parts[0].lower() in {"addstickers", "addemoji"}:
+        return parts[-1].lstrip("@").lower()
+    if not parts:
+        return ""
+    return parts[0].lstrip("@").lower()
 
 
 def contact_status(value: str | None, default: str = "not_sent") -> str:
@@ -364,6 +435,19 @@ def contact_status(value: str | None, default: str = "not_sent") -> str:
     if text in CONTACT_STATUSES:
         return text
     return default
+
+
+def has_other_social(socials: str | list | None) -> bool:
+    """True when this user has a social link besides dev.to and GitHub."""
+    raw = socials
+    if isinstance(socials, list):
+        raw = json.dumps(socials)
+    if not isinstance(raw, str):
+        return False
+    for link in load_social_links(raw):
+        if link["provider"] not in {"devto", "github"}:
+            return True
+    return False
 
 
 def load_social_links(raw: str | None) -> list[dict[str, str]]:
@@ -427,6 +511,53 @@ def merge_social_link_status(
             incoming if incoming in CONTACT_STATUSES else contact_status(fallback)
         )
         merged.append({"provider": provider, "url": url, "status": status})
+    return merged
+
+
+def dedupe_social_links(links: list[dict[str, str]] | None) -> list[dict[str, str]]:
+    """Drop a repeated link on this user. Different links stay.
+
+    The first copy stays. A later copy marked sent replaces it.
+    """
+    kept: list[dict[str, str]] = []
+    index: dict[str, int] = {}
+    for item in links or []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        key = social_url_key(url)
+        if not key:
+            continue
+        provider = str(item.get("provider") or "generic").strip().lower() or "generic"
+        status = str(item.get("status") or "").strip().lower()
+        if status not in CONTACT_STATUSES:
+            status = ""
+        if key not in index:
+            index[key] = len(kept)
+            kept.append({"provider": provider, "url": url, "status": status})
+            continue
+        if status == "sent" and kept[index[key]]["status"] != "sent":
+            kept[index[key]] = {"provider": provider, "url": url, "status": status}
+    return kept
+
+
+def keep_saved_telegram_links(
+    merged: list[dict[str, str]],
+    stored_raw: str | None,
+) -> list[dict[str, str]]:
+    """Keep a Telegram link added by hand when a profile refresh does not return it."""
+    seen = {social_url_key(item["url"]) for item in merged}
+    for item in load_social_links(stored_raw):
+        if item["provider"] != "telegram":
+            continue
+        key = social_url_key(item["url"])
+        if key in seen:
+            continue
+        seen.add(key)
+        status = item["status"] if item["status"] in CONTACT_STATUSES else "not_sent"
+        merged.append({"provider": "telegram", "url": item["url"], "status": status})
     return merged
 
 
@@ -509,6 +640,41 @@ def ensure_social_provider_names(conn: sqlite3.Connection) -> None:
     set_meta(conn, "social_provider_names_v2", "1")
 
 
+def ensure_refresh_social_provider_names(conn: sqlite3.Connection) -> None:
+    """Rename links whose host is now a known site, including freelance marketplaces."""
+    if get_meta(conn, "social_provider_names_v3") == "1":
+        return
+    from core.github_enrich import classify_provider
+
+    rows = conn.execute(
+        """
+        SELECT id, socials FROM users
+        WHERE socials IS NOT NULL AND TRIM(socials) NOT IN ('', '[]')
+        """
+    ).fetchall()
+    for row in rows:
+        original = load_social_links(row["socials"])
+        if not original:
+            continue
+        renamed: list[dict[str, str]] = []
+        changed = False
+        for link in original:
+            provider = classify_provider(link["provider"], link["url"])
+            if provider == "github":
+                changed = True
+                continue
+            status = link["status"] or "not_sent"
+            if provider != link["provider"] or status != link["status"]:
+                changed = True
+            renamed.append({"provider": provider, "url": link["url"], "status": status})
+        if changed:
+            conn.execute(
+                "UPDATE users SET socials = ? WHERE id = ?",
+                (json.dumps(renamed, ensure_ascii=False), int(row["id"])),
+            )
+    set_meta(conn, "social_provider_names_v3", "1")
+
+
 def ensure_drop_source_socials(conn: sqlite3.Connection) -> None:
     """A source profile is not also a social link."""
     if get_meta(conn, "social_source_links_v1") == "1":
@@ -552,24 +718,80 @@ def ensure_drop_source_socials(conn: sqlite3.Connection) -> None:
     set_meta(conn, "social_source_links_v1", "1")
 
 
-def ensure_suppressed_locations(conn: sqlite3.Connection) -> None:
-    """Locations that should hide a user, backfilled from people already suppressed."""
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS suppressed_locations (
-            location TEXT PRIMARY KEY,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
+def ensure_one_social_per_user(conn: sqlite3.Connection) -> None:
+    """Drop a repeated social link on a user. Different links on that user stay."""
+    if get_meta(conn, "social_unique_links_v1") == "1":
+        return
     rows = conn.execute(
         """
-        SELECT location, country FROM users
-        WHERE suppressed = 1 AND TRIM(location) != ''
+        SELECT id, socials FROM users
+        WHERE socials IS NOT NULL AND TRIM(socials) NOT IN ('', '[]')
         """
     ).fetchall()
     for row in rows:
-        mark_suppressed_location(conn, row["location"], row["country"])
+        try:
+            parsed = json.loads(row["socials"])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, list):
+            continue
+        deduped = dedupe_social_links(parsed)
+        for link in deduped:
+            if link["status"] not in CONTACT_STATUSES:
+                link["status"] = "not_sent"
+        comparable = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            status = str(item.get("status") or "").strip().lower()
+            comparable.append((
+                str(item.get("provider") or "generic").strip().lower() or "generic",
+                url,
+                status if status in CONTACT_STATUSES else "not_sent",
+            ))
+        after = [(link["provider"], link["url"], link["status"]) for link in deduped]
+        if comparable == after:
+            continue
+        conn.execute(
+            "UPDATE users SET socials = ? WHERE id = ?",
+            (json.dumps(deduped, ensure_ascii=False), int(row["id"])),
+        )
+    set_meta(conn, "social_unique_links_v1", "1")
+
+
+def ensure_drop_noloc_without_socials(conn: sqlite3.Connection) -> None:
+    """Remove no-location users who have nothing beyond dev.to, GitHub, and email.
+
+    A dev.to row with no GitHub account is left in place. A no-location user
+    who has another social link stays too.
+    """
+    if get_meta(conn, "noloc_without_socials_v1") == "1":
+        return
+    rows = conn.execute(
+        """
+        SELECT id, source, github, socials FROM users
+        WHERE lower(coalesce(country, '')) IN ('', 'noloc')
+        """
+    ).fetchall()
+    drop_ids: list[int] = []
+    for row in rows:
+        if has_other_social(row["socials"]):
+            continue
+        origin = source_origin(row["source"])
+        github = str(row["github"] or "").strip()
+        if origin == "github" or (origin == "devto" and github):
+            drop_ids.append(int(row["id"]))
+    for start in range(0, len(drop_ids), 400):
+        delete_users_by_ids(conn, drop_ids[start:start + 400])
+    set_meta(conn, "noloc_without_socials_v1", "1")
+
+
+def ensure_suppressed_locations(conn: sqlite3.Connection) -> None:
+    """Remove the old place-wide suppress list. A suppressed person stays one person."""
+    conn.execute("DROP TABLE IF EXISTS suppressed_locations")
 
 
 def ensure_outcome_column(conn: sqlite3.Connection) -> None:
@@ -1000,7 +1222,8 @@ def country_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         """
         SELECT country,
                COUNT(*) AS n,
-               SUM(CASE WHEN lower(mail_status) = 'sent' THEN 1 ELSE 0 END) AS sent
+               SUM(CASE WHEN lower(mail_status) = 'sent' THEN 1 ELSE 0 END) AS sent,
+               SUM(CASE WHEN favorite = 1 THEN 1 ELSE 0 END) AS favorites
         FROM users
         WHERE suppressed = 0
         GROUP BY country
@@ -1012,9 +1235,28 @@ def country_stats(conn: sqlite3.Connection) -> list[dict[str, Any]]:
             "country": str(r["country"]),
             "count": int(r["n"]),
             "sent": int(r["sent"] or 0),
+            "favorites": int(r["favorites"] or 0),
         }
         for r in rows
     ]
+
+
+def delete_users_by_ids(conn: sqlite3.Connection, user_ids: list[int]) -> int:
+    """Delete these users and their queue rows."""
+    ids = [int(user_id) for user_id in user_ids]
+    if not ids:
+        return 0
+    id_placeholders = ",".join("?" for _ in ids)
+    conn.execute(
+        f"DELETE FROM queue_items WHERE user_id IN ({id_placeholders})",
+        ids,
+    )
+    conn.execute(
+        f"DELETE FROM users WHERE id IN ({id_placeholders})",
+        ids,
+    )
+    recount_total_saved(conn)
+    return len(ids)
 
 
 def delete_users_by_countries(
@@ -1033,19 +1275,187 @@ def delete_users_by_countries(
             slugs,
         ).fetchall()
     ]
-    if not user_ids:
+    return delete_users_by_ids(conn, user_ids)
+
+
+def peek_user_by_github(conn: sqlite3.Connection, login: str) -> sqlite3.Row | None:
+    """The stored row for this GitHub username, without merging duplicates."""
+    account = (login or "").strip()
+    if not account:
+        return None
+    return conn.execute(
+        """
+        SELECT id, github_bio, socials FROM users
+        WHERE github = ? COLLATE NOCASE
+        ORDER BY id
+        LIMIT 1
+        """,
+        (account,),
+    ).fetchone()
+
+
+def clear_github_bio(conn: sqlite3.Connection, user_id: int) -> None:
+    """Drop stored bio text after its contact links have been extracted."""
+    conn.execute(
+        "UPDATE users SET github_bio = '' WHERE id = ?",
+        (int(user_id),),
+    )
+
+
+def append_social_links(
+    conn: sqlite3.Connection,
+    user_id: int,
+    links: list[dict[str, str]] | None,
+) -> int:
+    """Add known-site links that are not already stored. Returns how many were added."""
+    from core.github_enrich import SOURCE_PROVIDERS, canonical_x_url, classify_provider
+
+    row = conn.execute(
+        "SELECT socials FROM users WHERE id = ?",
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
         return 0
-    id_placeholders = ",".join("?" for _ in user_ids)
+    stored = load_social_links(row["socials"])
+    seen = {social_url_key(item["url"]) for item in stored}
+    added = 0
+    for item in links or []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        provider = classify_provider(str(item.get("provider") or ""), url)
+        if provider in SOURCE_PROVIDERS or provider == "generic":
+            continue
+        if provider == "x":
+            url = canonical_x_url(url)
+        key = social_url_key(url)
+        if key in seen:
+            continue
+        seen.add(key)
+        stored.append({"provider": provider, "url": url, "status": "not_sent"})
+        added += 1
+    if not added:
+        return 0
+    for link in stored:
+        if link["status"] not in CONTACT_STATUSES:
+            link["status"] = "not_sent"
     conn.execute(
-        f"DELETE FROM queue_items WHERE user_id IN ({id_placeholders})",
-        user_ids,
+        "UPDATE users SET socials = ? WHERE id = ?",
+        (json.dumps(stored, ensure_ascii=False), int(user_id)),
     )
+    return added
+
+
+def find_user_by_github(conn: sqlite3.Connection, login: str) -> sqlite3.Row | None:
+    """The stored person for this GitHub username, if one row already has it.
+
+    When both scrapers saved the same username, the GitHub scraper's row is kept
+    and the others are removed.
+    """
+    account = (login or "").strip()
+    if not account:
+        return None
+    rows = conn.execute(
+        """
+        SELECT id, email, name, display_name, link, github, location, country,
+               source, platform_user_id, favorite, suppressed
+        FROM users
+        WHERE github = ? COLLATE NOCASE
+        ORDER BY id
+        """,
+        (account,),
+    ).fetchall()
+    if not rows:
+        return None
+    keep = rows[0]
+    for row in rows:
+        if source_origin(row["source"]) == "github":
+            keep = row
+            break
+    extras = [int(row["id"]) for row in rows if int(row["id"]) != int(keep["id"])]
+    if extras:
+        if any(int(row["favorite"] or 0) for row in rows):
+            conn.execute("UPDATE users SET favorite = 1 WHERE id = ?", (int(keep["id"]),))
+        if any(int(row["suppressed"] or 0) for row in rows):
+            conn.execute(
+                "UPDATE users SET suppressed = 1 WHERE id = ?", (int(keep["id"]),)
+            )
+        delete_users_by_ids(conn, extras)
+        keep = conn.execute(
+            """
+            SELECT id, email, name, display_name, link, github, location, country,
+                   source, platform_user_id, favorite, suppressed
+            FROM users WHERE id = ?
+            """,
+            (int(keep["id"]),),
+        ).fetchone()
+    return keep
+
+
+def delete_users_by_github(conn: sqlite3.Connection, login: str) -> int:
+    """Remove every row stored for this GitHub username."""
+    account = (login or "").strip()
+    if not account:
+        return 0
+    user_ids = [
+        int(row["id"])
+        for row in conn.execute(
+            "SELECT id FROM users WHERE github = ? COLLATE NOCASE",
+            (account,),
+        ).fetchall()
+    ]
+    return delete_users_by_ids(conn, user_ids)
+
+
+def claim_github_scraper(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    email: str,
+    link: str,
+    location: str,
+    country: str,
+    platform_user_id: int | str | None,
+    github: str,
+) -> None:
+    """The GitHub scraper owns this row. Mail status and edits stay as they are."""
+    login = (github or "").strip()
+    email_text = (email or "").strip()
+    other = None
+    if email_text:
+        other = conn.execute(
+            "SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?",
+            (email_text, int(user_id)),
+        ).fetchone()
+    platform_id = normalize_platform_user_id(platform_user_id)
+    fields = [
+        "link = ?",
+        "github = ?",
+        "location = ?",
+        "country = ?",
+        "source = ?",
+        "platform_user_id = ?",
+        "updated_at = ?",
+    ]
+    values: list[Any] = [
+        link or "",
+        login,
+        location or "",
+        country,
+        compose_source("github", login),
+        platform_id,
+        utc_now(),
+    ]
+    if email_text and other is None:
+        fields.insert(0, "email = ?")
+        values.insert(0, email_text)
+    values.append(int(user_id))
     conn.execute(
-        f"DELETE FROM users WHERE id IN ({id_placeholders})",
-        user_ids,
+        f"UPDATE users SET {', '.join(fields)} WHERE id = ?",
+        values,
     )
-    recount_total_saved(conn)
-    return len(user_ids)
 
 
 _purged_exclude_slugs: frozenset[str] | None = None
@@ -1125,7 +1535,8 @@ def update_github_profile(
 ) -> None:
     """Store a fetched GitHub profile. Does not change updated_at.
 
-    socials=None leaves the column NULL so a later pass can retry.
+    socials=None leaves the socials column NULL so a later pass can retry.
+    The bio text is not stored. Callers extract contact links from it first.
     The GitHub display name replaces users.name only when that name is empty
     or is still the Dev.to slug. A hand-edited display_name is left as-is.
     GitHub's location fills a noloc row when it names a country. A location
@@ -1152,28 +1563,31 @@ def update_github_profile(
         if placed.country != "noloc" and not placed.skipped:
             location = placed.location
             country = placed.country
-    bio_text = (bio or "").strip()
     if socials is None:
         conn.execute(
             """
             UPDATE users
-            SET github_bio = ?, name = ?, display_name = ?, location = ?, country = ?
+            SET github_bio = '', name = ?, display_name = ?, location = ?, country = ?
             WHERE id = ?
             """,
-            (bio_text, name, display_name, location, country, int(user_id)),
+            (name, display_name, location, country, int(user_id)),
         )
     else:
         conn.execute(
             """
             UPDATE users
-            SET github_bio = ?, socials = ?, name = ?, display_name = ?,
+            SET github_bio = '', socials = ?, name = ?, display_name = ?,
                 location = ?, country = ?
             WHERE id = ?
             """,
             (
-                bio_text,
                 json.dumps(
-                    merge_social_link_status(socials, row["socials"]),
+                    dedupe_social_links(
+                        keep_saved_telegram_links(
+                            merge_social_link_status(socials, row["socials"]),
+                            row["socials"],
+                        )
+                    ),
                     ensure_ascii=False,
                 ),
                 name,
@@ -1186,51 +1600,14 @@ def update_github_profile(
     conn.commit()
 
 
-def suppressed_location_marks(conn: sqlite3.Connection) -> set[str]:
-    """Formatted locations that hide whoever is moved onto them."""
-    rows = conn.execute("SELECT location FROM suppressed_locations").fetchall()
-    return {str(row["location"]).strip() for row in rows if str(row["location"]).strip()}
-
-
-def mark_suppressed_location(
-    conn: sqlite3.Connection,
-    location: str | None,
-    country: str | None = None,
-) -> str:
-    """Remember a place so a later edit to the same place suppresses that user."""
-    from core.locations import format_place
-
-    text = (location or "").strip()
-    slug = (country or "").strip().lower()
-    if text and slug and slug != "noloc":
-        formatted = format_place(text, slug)
-        if formatted:
-            text = formatted
-    if not text:
-        return ""
-    conn.execute(
-        """
-        INSERT OR IGNORE INTO suppressed_locations (location, created_at)
-        VALUES (?, ?)
-        """,
-        (text, utc_now()),
-    )
-    return text
-
-
 def suppress_user(conn: sqlite3.Connection, user_id: int) -> dict[str, Any] | None:
-    """Hide a user from both pools. The row stays so the email cannot be inserted again.
-
-    A non-empty location is marked, so editing someone else onto that place
-    suppresses them too.
-    """
+    """Hide this user from both pools. The row stays so the email cannot be inserted again."""
     row = conn.execute(
-        "SELECT id, location, country FROM users WHERE id = ?",
+        "SELECT id FROM users WHERE id = ?",
         (int(user_id),),
     ).fetchone()
     if row is None:
         return None
-    mark_suppressed_location(conn, row["location"], row["country"])
     conn.execute(
         "UPDATE users SET suppressed = 1, updated_at = ? WHERE id = ?",
         (utc_now(), int(user_id)),
@@ -1274,7 +1651,7 @@ def _public_user(conn: sqlite3.Connection, user_id: int) -> dict[str, Any] | Non
         """
         SELECT id, email, name, display_name, link, github, github_bio, socials,
                location, country, source, mail_status, social_status, sender_email,
-               mail_template, outcome, created_at, updated_at
+               mail_template, outcome, favorite, created_at, updated_at
         FROM users WHERE id = ?
         """,
         (int(user_id),),
@@ -1289,9 +1666,8 @@ def apply_user_location(
 ) -> dict[str, Any] | None:
     """Set a user's place from free text.
 
-    An excluded country deletes the user. A location marked by a suppressed
-    user updates the place and suppresses this user too. Unrecognized text
-    raises UnknownLocation and leaves the row unchanged.
+    An excluded country deletes the user. Unrecognized text raises
+    UnknownLocation and leaves the row unchanged.
     """
     from core.locations import place_decision
 
@@ -1301,10 +1677,7 @@ def apply_user_location(
     ).fetchone()
     if existing is None:
         return None
-    decision = place_decision(
-        location,
-        suppressed_locations=suppressed_location_marks(conn),
-    )
+    decision = place_decision(location)
     action = decision["action"]
     if action == "delete":
         delete_user(conn, user_id)
@@ -1323,8 +1696,6 @@ def apply_user_location(
         """,
         (decision["location"], decision["country"], now, int(user_id)),
     )
-    if action == "suppress":
-        suppress_user(conn, user_id)
     return {
         "action": action,
         "user": _public_user(conn, user_id),
@@ -1382,6 +1753,388 @@ def update_user_display_name(
     return row_to_dict(updated)
 
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
+_PROFILE_SOCIAL_LIMIT = 40
+
+
+def github_login_from_text(value: str) -> str:
+    """A GitHub username, or the account in a github.com profile link."""
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if "github.com" in text.lower():
+        raw = text if "://" in text else "https://" + text.lstrip("/")
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            parsed = None
+        host = (parsed.hostname or "").lower() if parsed else ""
+        if host == "github.com" or host.endswith(".github.com"):
+            parts = [part for part in (parsed.path or "").split("/") if part]
+            text = parts[0] if parts else ""
+    text = text.lstrip("@").strip()
+    if not text:
+        return ""
+    if not _GITHUB_LOGIN_RE.fullmatch(text):
+        raise ValueError("GitHub username can use letters, numbers, and hyphens")
+    return text
+
+
+def source_for_account(source: str | None, github: str) -> str:
+    """Origin platform, with the github tag only while a username is stored."""
+    origin = source_origin(source) or "devto"
+    if origin == "github":
+        return "github"
+    return compose_source(origin, github)
+
+
+def prepare_manual_socials(
+    existing_raw: str | None,
+    urls: list[str] | None,
+) -> list[dict[str, str]]:
+    """The edited link list. An unchanged link keeps its status. A new one is not sent.
+
+    GitHub and dev.to stay sources, so a profile link for either is rejected.
+    A repeated link is kept once. Removing a link removes it.
+    """
+    from core.github_enrich import SOURCE_PROVIDERS, classify_provider
+
+    stored = {
+        social_url_key(link["url"]): contact_status(link.get("status") or "not_sent")
+        for link in load_social_links(existing_raw)
+    }
+    prepared: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in urls or []:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        if len(prepared) >= _PROFILE_SOCIAL_LIMIT:
+            raise ValueError("Keep the list to 40 links")
+        if len(text) > 500:
+            raise ValueError("A social link is too long")
+        if not text.startswith(("http://", "https://")):
+            if " " in text or "." not in text:
+                raise ValueError("Each social link needs a full address, starting with https://")
+            text = "https://" + text.lstrip("/")
+        provider = classify_provider("", text)
+        if provider in SOURCE_PROVIDERS:
+            raise ValueError(
+                "GitHub and dev.to stay sources. Put a GitHub username in the GitHub field."
+            )
+        key = social_url_key(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        prepared.append({
+            "provider": provider,
+            "url": text,
+            "status": stored.get(key, "not_sent"),
+        })
+    return dedupe_social_links(prepared)
+
+
+def _profile_select(conn: sqlite3.Connection, user_id: int):
+    return conn.execute(
+        """
+        SELECT id, email, name, display_name, link, github, github_bio, socials,
+               location, country, source, mail_status, social_status, outcome,
+               favorite, created_at, updated_at, sender_email, mail_template
+        FROM users WHERE id = ?
+        """,
+        (int(user_id),),
+    ).fetchone()
+
+
+def update_user_profile(
+    conn: sqlite3.Connection,
+    user_id: int,
+    *,
+    display_name: str,
+    email: str,
+    location: str,
+    github: str,
+    socials: list[str] | None,
+) -> dict[str, Any] | None:
+    """Save the person dialog. An excluded location deletes the user and skips the rest.
+
+    Mail that was already sent keeps the display name. Email stays unique.
+    A GitHub-origin row keeps a username, and its profile link follows that username.
+    """
+    row = conn.execute(
+        """
+        SELECT id, name, display_name, email, link, github, socials, location,
+               country, source, mail_status
+        FROM users WHERE id = ?
+        """,
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    address = (email or "").strip()
+    if not address or len(address) > 320 or not _EMAIL_RE.fullmatch(address):
+        raise ValueError("Enter a valid email address")
+    taken = conn.execute(
+        "SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?",
+        (address, int(user_id)),
+    ).fetchone()
+    if taken is not None:
+        raise ValueError("That email already belongs to another person")
+
+    current_display = str(row["display_name"] or "")
+    next_display = (display_name or "").strip()
+    if len(next_display) > DISPLAY_NAME_MAX_LEN:
+        next_display = next_display[:DISPLAY_NAME_MAX_LEN].rstrip()
+    if not next_display:
+        next_display = str(row["name"] or "")
+    if (row["mail_status"] or "").lower() == "sent" and next_display != current_display:
+        raise ValueError("Display name is fixed after the email is sent")
+
+    login = github_login_from_text(github)
+    origin = source_origin(row["source"]) or "devto"
+    if origin == "github" and not login:
+        raise ValueError("This person came from GitHub, so the username stays")
+
+    location_text = (location or "").strip()
+    current_location = str(row["location"] or "").strip()
+    decision = None
+    if location_text != current_location:
+        from core.locations import place_decision
+
+        decision = place_decision(location_text)
+        if decision["action"] == "delete":
+            delete_user(conn, user_id)
+            return {
+                "action": "delete",
+                "user": None,
+                "location": decision["location"],
+                "country": decision["country"],
+            }
+
+    links = prepare_manual_socials(row["socials"], socials)
+    if origin == "github":
+        link = f"https://github.com/{login}"
+        source_value = "github"
+    else:
+        link = row["link"] or ""
+        source_value = source_for_account(origin, login)
+    now = utc_now()
+    conn.execute(
+        """
+        UPDATE users
+        SET email = ?, display_name = ?, github = ?, link = ?, source = ?,
+            socials = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            address,
+            next_display,
+            login,
+            link,
+            source_value,
+            json.dumps(links, ensure_ascii=False),
+            now,
+            int(user_id),
+        ),
+    )
+    if decision is not None:
+        conn.execute(
+            "UPDATE users SET location = ?, country = ? WHERE id = ?",
+            (decision["location"], decision["country"], int(user_id)),
+        )
+    saved = _profile_select(conn, user_id)
+    return {
+        "action": "save",
+        "user": row_to_dict(saved),
+        "location": decision["location"] if decision else current_location,
+        "country": decision["country"] if decision else str(row["country"] or ""),
+    }
+
+
+def _profile_user(conn: sqlite3.Connection, user_id: int) -> dict[str, Any] | None:
+    saved = _profile_select(conn, user_id)
+    if saved is None:
+        return None
+    return row_to_dict(saved)
+
+
+def update_user_email(
+    conn: sqlite3.Connection,
+    user_id: int,
+    email: str,
+) -> dict[str, Any] | None:
+    """Replace one person's email. Another person already using it is rejected."""
+    row = conn.execute(
+        "SELECT id FROM users WHERE id = ?",
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    address = (email or "").strip()
+    if not address or len(address) > 320 or not _EMAIL_RE.fullmatch(address):
+        raise ValueError("Enter a valid email address")
+    taken = conn.execute(
+        "SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id != ?",
+        (address, int(user_id)),
+    ).fetchone()
+    if taken is not None:
+        raise ValueError("That email already belongs to another person")
+    conn.execute(
+        "UPDATE users SET email = ?, updated_at = ? WHERE id = ?",
+        (address, utc_now(), int(user_id)),
+    )
+    return _profile_user(conn, user_id)
+
+
+def update_user_github_login(
+    conn: sqlite3.Connection,
+    user_id: int,
+    github: str,
+) -> dict[str, Any] | None:
+    """Store a GitHub username. A GitHub-origin person keeps one, and the profile link follows it."""
+    row = conn.execute(
+        "SELECT id, link, source FROM users WHERE id = ?",
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    login = github_login_from_text(github)
+    origin = source_origin(row["source"]) or "devto"
+    if origin == "github" and not login:
+        raise ValueError("This person came from GitHub, so the username stays")
+    if origin == "github":
+        link = f"https://github.com/{login}"
+        source_value = "github"
+    else:
+        link = row["link"] or ""
+        source_value = source_for_account(origin, login)
+    conn.execute(
+        """
+        UPDATE users
+        SET github = ?, link = ?, source = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (login, link, source_value, utc_now(), int(user_id)),
+    )
+    return _profile_user(conn, user_id)
+
+
+def _manual_social_url(url: str) -> dict[str, str]:
+    prepared = prepare_manual_socials(None, [url])
+    if not prepared:
+        raise ValueError("Each social link needs a full address, starting with https://")
+    return prepared[0]
+
+
+def _socials_for_edit(raw: str | None) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    for link in load_social_links(raw):
+        status = str(link.get("status") or "").strip().lower()
+        links.append({
+            "provider": link["provider"],
+            "url": link["url"],
+            "status": status if status in CONTACT_STATUSES else "not_sent",
+        })
+    return links
+
+
+def _store_socials(
+    conn: sqlite3.Connection,
+    user_id: int,
+    links: list[dict[str, str]],
+) -> dict[str, Any]:
+    conn.execute(
+        "UPDATE users SET socials = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(dedupe_social_links(links), ensure_ascii=False), utc_now(), int(user_id)),
+    )
+    return _profile_user(conn, user_id)
+
+
+def add_user_social_link(
+    conn: sqlite3.Connection,
+    user_id: int,
+    url: str,
+) -> dict[str, Any] | None:
+    """Append one link. A repeated link is rejected. The new link is not sent."""
+    row = conn.execute(
+        "SELECT id, socials FROM users WHERE id = ?",
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    incoming = _manual_social_url(url)
+    links = _socials_for_edit(row["socials"])
+    key = social_url_key(incoming["url"])
+    if any(social_url_key(link["url"]) == key for link in links):
+        raise ValueError("That link is already saved")
+    if len(links) >= _PROFILE_SOCIAL_LIMIT:
+        raise ValueError("Keep the list to 40 links")
+    links.append({
+        "provider": incoming["provider"],
+        "url": incoming["url"],
+        "status": "not_sent",
+    })
+    return _store_socials(conn, user_id, links)
+
+
+def replace_user_social_link(
+    conn: sqlite3.Connection,
+    user_id: int,
+    previous_url: str,
+    url: str,
+) -> dict[str, Any] | None:
+    """Replace one saved link. The same link keeps its status. A new address starts not sent."""
+    row = conn.execute(
+        "SELECT id, socials FROM users WHERE id = ?",
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    incoming = _manual_social_url(url)
+    links = _socials_for_edit(row["socials"])
+    previous = social_url_key(previous_url)
+    index = next(
+        (i for i, link in enumerate(links) if social_url_key(link["url"]) == previous),
+        -1,
+    )
+    if index < 0:
+        raise ValueError("That link is no longer on this person")
+    new_key = social_url_key(incoming["url"])
+    if any(
+        i != index and social_url_key(link["url"]) == new_key
+        for i, link in enumerate(links)
+    ):
+        raise ValueError("That link is already saved")
+    status = links[index]["status"] if new_key == previous else "not_sent"
+    links[index] = {
+        "provider": incoming["provider"],
+        "url": incoming["url"],
+        "status": status,
+    }
+    return _store_socials(conn, user_id, links)
+
+
+def remove_user_social_link(
+    conn: sqlite3.Connection,
+    user_id: int,
+    url: str,
+) -> dict[str, Any] | None:
+    """Drop one saved link."""
+    row = conn.execute(
+        "SELECT id, socials FROM users WHERE id = ?",
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    key = social_url_key(url)
+    links = _socials_for_edit(row["socials"])
+    kept = [link for link in links if social_url_key(link["url"]) != key]
+    if len(kept) == len(links):
+        raise ValueError("That link is no longer on this person")
+    return _store_socials(conn, user_id, kept)
+
+
 def update_user_outcome(
     conn: sqlite3.Connection,
     user_id: int,
@@ -1411,6 +2164,59 @@ def update_user_outcome(
         (int(user_id),),
     ).fetchone()
     return row_to_dict(updated)
+
+
+def add_telegram_link(
+    conn: sqlite3.Connection,
+    user_id: int,
+    username: str,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Store https://t.me/{username} on this user. Returns (user, added)."""
+    import re
+
+    handle = (username or "").strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,32}", handle):
+        raise ValueError("That username cannot be stored as a Telegram link")
+    row = conn.execute(
+        "SELECT id, socials FROM users WHERE id = ?",
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None, False
+    url = f"https://t.me/{handle}"
+    links = load_social_links(row["socials"])
+    key = social_url_key(url)
+    for link in links:
+        if social_url_key(link["url"]) == key:
+            return _public_user(conn, user_id), False
+    for link in links:
+        if not link["status"]:
+            link["status"] = "not_sent"
+    links.append({"provider": "telegram", "url": url, "status": "not_sent"})
+    conn.execute(
+        "UPDATE users SET socials = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(links, ensure_ascii=False), utc_now(), int(user_id)),
+    )
+    return _public_user(conn, user_id), True
+
+
+def set_user_favorite(
+    conn: sqlite3.Connection,
+    user_id: int,
+    favorite: bool,
+) -> dict[str, Any] | None:
+    """Mark or clear the heart on one user. Does not change updated_at."""
+    row = conn.execute(
+        "SELECT id FROM users WHERE id = ?",
+        (int(user_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute(
+        "UPDATE users SET favorite = ? WHERE id = ?",
+        (1 if favorite else 0, int(user_id)),
+    )
+    return _public_user(conn, user_id)
 
 
 def mail_template_name(value: str | None) -> str:
@@ -1600,12 +2406,26 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
-def is_scrape_paused(conn: sqlite3.Connection) -> bool:
-    return get_meta(conn, "scrape_paused", "0") in ("1", "true", "True", "yes")
+def control_meta_key(name: str, platform_id: str | None = None) -> str:
+    """Dev.to keeps the original meta keys. Other scrapers get a suffix."""
+    platform = (platform_id or "").strip().lower()
+    if platform in ("", "devto"):
+        return name
+    return f"{name}:{platform}"
 
 
-def set_scrape_paused(conn: sqlite3.Connection, paused: bool) -> None:
-    set_meta(conn, "scrape_paused", "1" if paused else "0")
+def is_scrape_paused(
+    conn: sqlite3.Connection, platform_id: str | None = None
+) -> bool:
+    key = control_meta_key("scrape_paused", platform_id)
+    return get_meta(conn, key, "0") in ("1", "true", "True", "yes")
+
+
+def set_scrape_paused(
+    conn: sqlite3.Connection, paused: bool, platform_id: str | None = None
+) -> None:
+    key = control_meta_key("scrape_paused", platform_id)
+    set_meta(conn, key, "1" if paused else "0")
 
 
 DEFAULT_SCRAPE_DAILY_CAP = 50
@@ -1653,20 +2473,26 @@ def touch_scrape_heartbeat(
     conn: sqlite3.Connection,
     *,
     loop: str = SCRAPE_LOOP_RUNNING,
+    platform_id: str | None = None,
 ) -> None:
     status = (
         loop
         if loop in (SCRAPE_LOOP_RUNNING, SCRAPE_LOOP_IDLING)
         else SCRAPE_LOOP_RUNNING
     )
-    set_meta(conn, "scrape_heartbeat_at", tokyo_now())
-    set_meta(conn, "scrape_loop", status)
+    set_meta(conn, control_meta_key("scrape_heartbeat_at", platform_id), tokyo_now())
+    set_meta(conn, control_meta_key("scrape_loop", platform_id), status)
 
 
 def scrape_heartbeat_age_sec(
-    conn: sqlite3.Connection, *, now: datetime | None = None
+    conn: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+    platform_id: str | None = None,
 ) -> float | None:
-    parsed = _parse_iso_datetime(get_meta(conn, "scrape_heartbeat_at", ""))
+    parsed = _parse_iso_datetime(
+        get_meta(conn, control_meta_key("scrape_heartbeat_at", platform_id), "")
+    )
     if parsed is None:
         return None
     if now is None:
@@ -1687,8 +2513,9 @@ def scrape_process_alive(
     *,
     now: datetime | None = None,
     stale_after_sec: float = SCRAPE_HEARTBEAT_STALE_SEC,
+    platform_id: str | None = None,
 ) -> bool:
-    age = scrape_heartbeat_age_sec(conn, now=now)
+    age = scrape_heartbeat_age_sec(conn, now=now, platform_id=platform_id)
     return age is not None and age <= float(stale_after_sec)
 
 
@@ -1804,6 +2631,7 @@ def scrape_control_snapshot(
         status = "running"
 
     return {
+        "platform": "devto",
         "status": status,
         "alive": alive,
         "paused": paused,
@@ -1817,6 +2645,159 @@ def scrape_control_snapshot(
         "seconds_until_midnight": seconds_until_next_tokyo_midnight(now),
         "heartbeat_at": heartbeat_at or None,
         "heartbeat_age_sec": heartbeat_age,
+    }
+
+
+def ensure_github_accounts(conn: sqlite3.Connection) -> None:
+    """Public GitHub accounts from the list endpoint. Not the mail pool."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS github_accounts (
+            github_id INTEGER PRIMARY KEY,
+            login TEXT NOT NULL,
+            account_type TEXT NOT NULL,
+            html_url TEXT NOT NULL,
+            scraped_at TEXT NOT NULL
+        )
+        """
+    )
+
+
+def insert_github_accounts(
+    conn: sqlite3.Connection, accounts: list[dict[str, Any]]
+) -> int:
+    """Insert new GitHub account ids. Existing ids stay as first saved."""
+    now = utc_now()
+    inserted = 0
+    for account in accounts:
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO github_accounts
+                (github_id, login, account_type, html_url, scraped_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                int(account["github_id"]),
+                str(account["login"]),
+                str(account["account_type"]),
+                str(account["html_url"]),
+                now,
+            ),
+        )
+        inserted += int(cur.rowcount or 0)
+    return inserted
+
+
+def trim_github_pool(conn: sqlite3.Connection, cap: int) -> int:
+    """Keep the oldest `cap` pooled logins. Returns how many were removed."""
+    limit = max(0, int(cap))
+    try:
+        rows = conn.execute(
+            """
+            SELECT github_id FROM github_accounts
+            ORDER BY github_id
+            LIMIT -1 OFFSET ?
+            """,
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return 0
+    removed = 0
+    for row in rows:
+        conn.execute(
+            "DELETE FROM github_accounts WHERE github_id = ?",
+            (int(row["github_id"]),),
+        )
+        removed += 1
+    return removed
+
+
+def list_github_pool(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Usernames waiting for a GitHub profile lookup, oldest id first."""
+    try:
+        rows = conn.execute(
+            "SELECT github_id, login FROM github_accounts ORDER BY github_id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [
+        {"github_id": int(row["github_id"]), "login": str(row["login"])}
+        for row in rows
+    ]
+
+
+def delete_github_account(conn: sqlite3.Connection, github_id: int) -> None:
+    conn.execute("DELETE FROM github_accounts WHERE github_id = ?", (int(github_id),))
+
+
+def count_users_from_source(conn: sqlite3.Connection, source: str) -> int:
+    """Users whose origin platform is source. A later ',github' tag does not count."""
+    origin = (source or "").strip().lower()
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM users
+        WHERE lower(source) = ? OR lower(source) LIKE ?
+        """,
+        (origin, origin + ",%"),
+    ).fetchone()
+    return int(row["n"] or 0) if row is not None else 0
+
+
+def count_github_accounts(conn: sqlite3.Connection) -> int:
+    try:
+        row = conn.execute("SELECT COUNT(*) AS n FROM github_accounts").fetchone()
+    except sqlite3.OperationalError:
+        return 0
+    if row is None:
+        return 0
+    return int(row["n"] or 0)
+
+
+def github_scrape_snapshot(
+    conn: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+    stale_after_sec: float = SCRAPE_HEARTBEAT_STALE_SEC,
+) -> dict[str, Any]:
+    """Status for the GitHub account-list scraper. It has no daily save cap."""
+    if now is None:
+        now = current_tokyo_datetime()
+    state = get_scrape_state(conn, "github")
+    paused = is_scrape_paused(conn, "github")
+    alive = scrape_process_alive(
+        conn, now=now, stale_after_sec=stale_after_sec, platform_id="github"
+    )
+    loop = get_meta(
+        conn, control_meta_key("scrape_loop", "github"), SCRAPE_LOOP_RUNNING
+    )
+    token = get_meta(conn, "github_scrape_token", "").strip()
+    if not alive:
+        status = "stopped"
+    elif paused:
+        status = "paused"
+    elif not token or loop == SCRAPE_LOOP_IDLING:
+        status = "idling"
+    else:
+        status = "running"
+    remaining_raw = get_meta(conn, "github_scrape_rate_remaining", "").strip()
+    try:
+        remaining = int(remaining_raw)
+    except ValueError:
+        remaining = None
+    return {
+        "platform": "github",
+        "status": status,
+        "alive": alive,
+        "paused": paused,
+        "last_id": state["last_id"],
+        "total_users": count_users_from_source(conn, "github"),
+        "pool_size": count_github_accounts(conn),
+        "token_configured": bool(token),
+        "rate_remaining": remaining,
+        "cap_enabled": False,
+        "daily_limit": None,
+        "saved_today": 0,
+        "daily_cap": None,
     }
 
 

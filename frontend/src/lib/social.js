@@ -39,6 +39,14 @@ const SOCIAL_HOSTS = [
   ['buymeacoffee', ['buymeacoffee.com']],
   ['kofi', ['ko-fi.com']],
   ['upwork', ['upwork.com']],
+  ['fiverr', ['fiverr.com']],
+  ['freelancer', ['freelancer.com']],
+  ['guru', ['guru.com']],
+  ['peopleperhour', ['peopleperhour.com']],
+  ['toptal', ['toptal.com']],
+  ['contra', ['contra.com']],
+  ['malt', ['malt.com', 'malt.fr', 'malt.de', 'malt.es']],
+  ['workana', ['workana.com']],
   ['credly', ['credly.com']],
   ['vk', ['vk.com']],
   ['xing', ['xing.com']],
@@ -59,7 +67,7 @@ const SOCIAL_HOSTS = [
 
 const hostMatches = (host, names) => names.some((name) => host === name || host.endsWith(`.${name}`));
 
-const recognizeProvider = (provider, url) => {
+export const recognizeProvider = (provider, url) => {
   const raw = String(provider || '').trim().toLowerCase();
   let host = '';
   try {
@@ -82,6 +90,32 @@ export const SOCIAL_ACCOUNT_FILTERS = [
   { id: 'telegram', label: 'Telegram' },
   { id: 'discord', label: 'Discord' },
   { id: 'whatsapp', label: 'WhatsApp' },
+  { id: 'x', label: 'X' },
+  { id: 'instagram', label: 'Instagram' },
+  { id: 'facebook', label: 'Facebook' },
+  { id: 'youtube', label: 'YouTube' },
+  { id: 'bluesky', label: 'Bluesky' },
+  { id: 'mastodon', label: 'Mastodon' },
+  { id: 'threads', label: 'Threads' },
+  { id: 'tiktok', label: 'TikTok' },
+  { id: 'reddit', label: 'Reddit' },
+  { id: 'twitch', label: 'Twitch' },
+  { id: 'medium', label: 'Medium' },
+  { id: 'stackoverflow', label: 'Stack Overflow' },
+  { id: 'leetcode', label: 'LeetCode' },
+  { id: 'gitlab', label: 'GitLab' },
+  { id: 'npm', label: 'npm' },
+  { id: 'huggingface', label: 'Hugging Face' },
+  { id: 'upwork', label: 'Upwork' },
+  { id: 'fiverr', label: 'Fiverr' },
+  { id: 'freelancer', label: 'Freelancer' },
+  { id: 'guru', label: 'Guru' },
+  { id: 'peopleperhour', label: 'PeoplePerHour' },
+  { id: 'toptal', label: 'Toptal' },
+  { id: 'contra', label: 'Contra' },
+  { id: 'malt', label: 'Malt' },
+  { id: 'workana', label: 'Workana' },
+  { id: 'other', label: 'Other' },
 ];
 
 export const emptySocialFilters = () =>
@@ -124,6 +158,15 @@ const SOCIAL_PLATFORM_LABELS = {
   buymeacoffee: 'Buy Me a Coffee',
   kofi: 'Ko-fi',
   upwork: 'Upwork',
+  fiverr: 'Fiverr',
+  freelancer: 'Freelancer',
+  guru: 'Guru',
+  peopleperhour: 'PeoplePerHour',
+  toptal: 'Toptal',
+  contra: 'Contra',
+  malt: 'Malt',
+  workana: 'Workana',
+  other: 'Other',
   credly: 'Credly',
   vk: 'VK',
   xing: 'Xing',
@@ -172,6 +215,18 @@ export const socialCopyValue = (provider, url) => {
   }
   return { kind: 'link', label: 'Link', value: href };
 };
+
+export const telegramHandleFromSocial = (provider, url) => {
+  if (String(provider || '').toLowerCase() === 'telegram') return '';
+  const copy = socialCopyValue(provider, url);
+  if (copy.kind !== 'username') return '';
+  const handle = String(copy.value || '').trim().replace(/^@+/, '');
+  if (!/^[A-Za-z0-9_]{1,32}$/.test(handle)) return '';
+  return handle;
+};
+
+export const userHasTelegram = (user) =>
+  socialItemsForUser(user).some((item) => item.provider === 'telegram');
 
 export const socialItemsForUser = (user) => {
   const items = [];

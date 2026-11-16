@@ -250,6 +250,135 @@ class ManualContactTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_bio_links_append_without_replacing_saved_ones(self):
+        conn = _conn()
+        try:
+            user_id = _user(conn, "bio@gmail.com")
+            conn.execute(
+                "UPDATE users SET github = ?, github_bio = ?, socials = ? WHERE id = ?",
+                (
+                    "ada",
+                    "https://t.me/ada https://linkedin.com/in/ada",
+                    '[{"provider":"x","url":"https://x.com/ada","status":"failed"}]',
+                    user_id,
+                ),
+            )
+            stored = db.peek_user_by_github(conn, "Ada")
+            added = db.append_social_links(
+                conn,
+                int(stored["id"]),
+                [
+                    {"provider": "telegram", "url": "https://t.me/ada"},
+                    {"provider": "x", "url": "https://x.com/ada"},
+                    {"provider": "generic", "url": "https://ada.dev"},
+                ],
+            )
+            self.assertEqual(added, 1)
+            db.clear_github_bio(conn, user_id)
+            bio = conn.execute(
+                "SELECT github_bio FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()["github_bio"]
+            self.assertEqual(bio, "")
+            links = json.loads(
+                conn.execute("SELECT socials FROM users WHERE id = ?", (user_id,)).fetchone()["socials"]
+            )
+            self.assertEqual(
+                links,
+                [
+                    {"provider": "x", "url": "https://x.com/ada", "status": "failed"},
+                    {"provider": "telegram", "url": "https://t.me/ada", "status": "not_sent"},
+                ],
+            )
+        finally:
+            conn.close()
+
+    def test_telegram_link_uses_the_same_username(self):
+        conn = _conn()
+        try:
+            user_id = _user(conn, "tgadd@gmail.com")
+            user, added = db.add_telegram_link(conn, user_id, "@user123")
+            self.assertTrue(added)
+            links = json.loads(user["socials"])
+            self.assertEqual(links, [{"provider": "telegram", "url": "https://t.me/user123", "status": "not_sent"}])
+            again, added_again = db.add_telegram_link(conn, user_id, "user123")
+            self.assertFalse(added_again)
+            self.assertEqual(json.loads(again["socials"]), links)
+            other, added_other = db.add_telegram_link(conn, user_id, "another_name")
+            self.assertTrue(added_other)
+            self.assertEqual(
+                json.loads(other["socials"]),
+                links + [{"provider": "telegram", "url": "https://t.me/another_name", "status": "not_sent"}],
+            )
+            with self.assertRaises(ValueError):
+                db.add_telegram_link(conn, user_id, "bad name")
+        finally:
+            conn.close()
+
+    def test_same_telegram_is_stored_once(self):
+        links = db.dedupe_social_links([
+            {"provider": "telegram", "url": "https://t.me/ptkdev", "status": "not_sent"},
+            {"provider": "telegram", "url": "https://t.me/quizquickanswerbot", "status": "not_sent"},
+            {"provider": "telegram", "url": "https://t.me/addstickers/ptkdev", "status": "not_sent"},
+            {"provider": "telegram", "url": "http://t.me/Ptkdev", "status": "not_sent"},
+            {"provider": "x", "url": "https://x.com/ptkdev", "status": "not_sent"},
+            {"provider": "x", "url": "https://x.com/ptkdevio", "status": "not_sent"},
+        ])
+        self.assertEqual(
+            [(item["provider"], item["url"]) for item in links],
+            [
+                ("telegram", "https://t.me/ptkdev"),
+                ("telegram", "https://t.me/quizquickanswerbot"),
+                ("x", "https://x.com/ptkdev"),
+                ("x", "https://x.com/ptkdevio"),
+            ],
+        )
+
+    def test_profile_refresh_keeps_a_hand_added_telegram_link(self):
+        conn = _conn()
+        try:
+            user_id = _user(conn, "keep-tg@gmail.com")
+            db.add_telegram_link(conn, user_id, "user123")
+            db.update_github_profile(
+                conn,
+                user_id,
+                bio="",
+                github_name="",
+                socials=[{"provider": "x", "url": "https://x.com/user123", "status": "not_sent"}],
+            )
+            links = json.loads(
+                conn.execute("SELECT socials FROM users WHERE id = ?", (user_id,)).fetchone()["socials"]
+            )
+            self.assertEqual(
+                links,
+                [
+                    {"provider": "x", "url": "https://x.com/user123", "status": "not_sent"},
+                    {"provider": "telegram", "url": "https://t.me/user123", "status": "not_sent"},
+                ],
+            )
+        finally:
+            conn.close()
+
+    def test_a_generic_fiverr_link_is_renamed(self):
+        conn = _conn()
+        try:
+            user_id = _user(conn, "fiverr@gmail.com")
+            conn.execute(
+                "UPDATE users SET socials = ? WHERE id = ?",
+                (
+                    '[{"provider":"generic","url":"https://www.fiverr.com/ada","status":"not_sent"}]',
+                    user_id,
+                ),
+            )
+            db.ensure_refresh_social_provider_names(conn)
+            db.ensure_refresh_social_provider_names(conn)
+            links = json.loads(
+                conn.execute("SELECT socials FROM users WHERE id = ?", (user_id,)).fetchone()["socials"]
+            )
+            self.assertEqual(links[0]["provider"], "fiverr")
+        finally:
+            conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

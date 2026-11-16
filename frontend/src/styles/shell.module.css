@@ -44,17 +44,10 @@
 
 .topbar-brand-mark {
   flex-shrink: 0;
-  width: 28px;
-  height: 28px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 0;
-  background: #0f172a;
-  color: #ffffff;
-  font-size: 0.85rem;
-  font-weight: 700;
-  letter-spacing: -0.03em;
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+  display: block;
 }
 
 .topbar-title {

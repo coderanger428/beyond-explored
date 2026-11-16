@@ -1,8 +1,9 @@
+import { useEffect, useState } from 'react';
 import Modal from 'react-modal';
 import { SocialIcon } from '../../components/SocialIcon';
 import { IconCopy, IconAt, IconChain, IconPhone } from '../../components/Icons';
 import { useDashboard } from '../../app/DashboardContext';
-import { socialProviderLabel, socialCopyValue } from '../../lib/social';
+import { socialProviderLabel, socialCopyValue, telegramHandleFromSocial, userHasTelegram } from '../../lib/social';
 import { copyText } from '../../lib/clipboard';
 import { templatePickerLabel } from '../../lib/templateText';
 import { cls } from '../../styles/cls';
@@ -24,7 +25,27 @@ export function ContactModal() {
     setContactModal,
     reloadMailPreview,
     saveContact,
+    addTelegramLink,
   } = useDashboard();
+  const telegramHandle = contactModal?.channel === 'social'
+    ? telegramHandleFromSocial(contactModal.link?.provider, contactModal.link?.url)
+    : '';
+  const [telegramDraft, setTelegramDraft] = useState(telegramHandle);
+  useEffect(() => {
+    setTelegramDraft(telegramHandle);
+  }, [contactModal?.user?.id, contactModal?.link?.url, telegramHandle]);
+  const telegramName = telegramDraft.trim().replace(/^@+/, '');
+  const telegramReady = /^[A-Za-z0-9_]{1,32}$/.test(telegramName);
+  const openedProvider = String(contactModal?.link?.provider || '').toLowerCase();
+  const openedStatus = String(contactModal?.link?.status || '').toLowerCase();
+  const thisXHasNoTelegram =
+    (openedProvider === 'x' || openedProvider === 'twitter') && openedStatus === 'failed';
+  const showTelegramAdd = Boolean(
+    telegramHandle
+    && contactModal?.user
+    && !userHasTelegram(contactModal.user)
+    && !thisXHasNoTelegram
+  );
   return (
     <>
         <Modal
@@ -147,12 +168,21 @@ export function ContactModal() {
                   {contactModal.link ? (
                     (() => {
                       const copy = socialCopyValue(contactModal.link.provider, contactModal.link.url);
+                      const providerLabel = socialProviderLabel(contactModal.link.provider);
+                      const nameCopiesLink = copy.kind === 'username';
+                      const nameCopy = nameCopiesLink ? (contactModal.link.url || copy.value) : copy.value;
                       return (
                         <div className={cls(modal, "social-copy-item")}>
-                          <span className={cls(modal, "social-copy-provider")}>
+                          <button
+                            type="button"
+                            className={cls(modal, "social-copy-provider")}
+                            aria-label={nameCopiesLink ? `Copy ${providerLabel} link` : `Copy ${copy.label}`}
+                            title={nameCopiesLink ? 'Copy link' : `Copy ${copy.label.toLowerCase()}`}
+                            onClick={() => copyText(nameCopy)}
+                          >
                             <SocialIcon size="lg" provider={contactModal.link.provider} />
-                            {socialProviderLabel(contactModal.link.provider)}
-                          </span>
+                            <span>{providerLabel}</span>
+                          </button>
                           <SocialKindMark kind={copy.kind} />
                           <code>{copy.value}</code>
                           <button type="button" className={`${cls(ui, "secondary-button")} ${cls(modal, "copy-button")}`} aria-label={`Copy ${copy.label}`} onClick={() => copyText(copy.value)}>
@@ -166,6 +196,37 @@ export function ContactModal() {
                   )}
                 </div>
               )}
+              {showTelegramAdd ? (
+                <label className={cls(modal, "telegram-add")}>
+                  Telegram
+                  <span className={cls(modal, "telegram-add-row")}>
+                    <span className={cls(modal, "telegram-add-field")}>
+                      <span>t.me/</span>
+                      <input
+                        type="text"
+                        value={telegramDraft}
+                        spellCheck={false}
+                        aria-label="Telegram username"
+                        title="Edit this if the Telegram username is different"
+                        onChange={(event) => setTelegramDraft(event.target.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' && telegramReady) {
+                            event.preventDefault();
+                            addTelegramLink(telegramName);
+                          }
+                        }}
+                      />
+                    </span>
+                    <button
+                      type="button"
+                      disabled={contactModal.loading || contactModal.saving || !telegramReady}
+                      onClick={() => addTelegramLink(telegramName)}
+                    >
+                      Add
+                    </button>
+                  </span>
+                </label>
+              ) : null}
               <div className={cls(ui, "form-actions-row form-actions-end")}>
                 <button
                   type="button"

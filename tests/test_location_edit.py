@@ -89,24 +89,28 @@ class ApplyUserLocationTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_suppressed_location_hides_the_next_user(self):
+    def test_suppressing_one_user_leaves_the_next_user(self):
         conn = _conn()
         try:
             marked_id = _user(conn, "ada@gmail.com", "Berlin, Germany", "germany")
             hidden = db.suppress_user(conn, marked_id)
             self.assertEqual(hidden["suppressed"], 1)
-            self.assertIn("Berlin, DEU", db.suppressed_location_marks(conn))
 
             other_id = _user(conn, "grace@gmail.com", "Austin, TX", "usa")
             result = db.apply_user_location(conn, other_id, "Berlin, Germany")
-            self.assertEqual(result["action"], "suppress")
+            self.assertEqual(result["action"], "save")
             self.assertEqual(result["user"]["location"], "Berlin, DEU")
             self.assertEqual(result["user"]["country"], "germany")
-            row = conn.execute(
+            other = conn.execute(
                 "SELECT suppressed FROM users WHERE id = ?",
                 (other_id,),
             ).fetchone()
-            self.assertEqual(row["suppressed"], 1)
+            self.assertEqual(other["suppressed"], 0)
+            still = conn.execute(
+                "SELECT suppressed FROM users WHERE id = ?",
+                (marked_id,),
+            ).fetchone()
+            self.assertEqual(still["suppressed"], 1)
         finally:
             conn.close()
 

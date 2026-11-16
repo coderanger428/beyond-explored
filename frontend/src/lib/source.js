@@ -1,5 +1,8 @@
 /** dev.to and GitHub profile links shown in the Source column. */
-export const SCRAPERS = [{ id: 'devto', label: 'dev.to' }];
+export const SCRAPERS = [
+  { id: 'devto', label: 'dev.to' },
+  { id: 'github', label: 'github.com' },
+];
 
 export const sourceLabel = (source) => {
   const value = String(source || '').trim().toLowerCase();

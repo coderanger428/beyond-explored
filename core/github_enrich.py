@@ -6,7 +6,9 @@ Social links the person listed on the profile need a second request.
 
 from __future__ import annotations
 
+import base64
 import os
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -58,6 +60,14 @@ _HOST_PROVIDERS = (
     ("buymeacoffee", ("buymeacoffee.com",)),
     ("kofi", ("ko-fi.com",)),
     ("upwork", ("upwork.com",)),
+    ("fiverr", ("fiverr.com",)),
+    ("freelancer", ("freelancer.com",)),
+    ("guru", ("guru.com",)),
+    ("peopleperhour", ("peopleperhour.com",)),
+    ("toptal", ("toptal.com",)),
+    ("contra", ("contra.com",)),
+    ("malt", ("malt.com", "malt.fr", "malt.de", "malt.es")),
+    ("workana", ("workana.com",)),
     ("credly", ("credly.com",)),
     ("vk", ("vk.com",)),
     ("xing", ("xing.com",)),
@@ -93,12 +103,27 @@ def load_dotenv(path: str | Path = ".env") -> None:
 
 
 def github_token() -> str:
-    """Token saved on the Settings page, with the environment as a fallback."""
+    """Token saved on the Settings page, with the environment as a fallback.
+
+    This is the dev.to lookup token. The GitHub account-list scraper uses
+    github_scrape_token() and does not read this value.
+    """
     stored = _stored_github_token()
     if stored:
         return stored
     load_dotenv()
     return os.environ.get("GITHUB_TOKEN", "").strip()
+
+
+def github_scrape_token() -> str:
+    """Token for the GitHub account-list scraper only."""
+    try:
+        import core.db as app_db
+
+        with app_db.get_conn() as conn:
+            return app_db.get_meta(conn, "github_scrape_token", "").strip()
+    except Exception:
+        return ""
 
 
 def _stored_github_token() -> str:
@@ -250,14 +275,15 @@ def mask_token(token: str) -> str:
     return f"{secret[:4]}…{secret[-4:]}"
 
 
-def github_headers() -> dict[str, str]:
+def github_headers(token: str | None = None) -> dict[str, str]:
+    """Authenticate with the caller's token. A missing argument uses the dev.to lookup token."""
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "scraping_dev_bot/1.0",
     }
-    token = github_token()
-    if token:
-        headers["Authorization"] = f"token {token}"
+    secret = (token if token is not None else github_token()).strip()
+    if secret:
+        headers["Authorization"] = f"Bearer {secret}"
     return headers
 
 
@@ -269,12 +295,37 @@ def social_accounts_path(username: str) -> str:
     return f"{user_path(username)}/social_accounts"
 
 
-def github_get(session: requests.Session, path: str) -> requests.Response:
+def readme_path(username: str) -> str:
+    login = quote((username or "").strip(), safe="")
+    return f"/repos/{login}/{login}/readme"
+
+
+def github_get(
+    session: requests.Session, path: str, *, token: str | None = None
+) -> requests.Response:
     return session.get(
         f"{GITHUB_API}{path}",
-        headers=github_headers(),
+        headers=github_headers(token),
         timeout=20,
     )
+
+
+def rate_limit_wait(response: requests.Response, *, now: float | None = None) -> float:
+    """Seconds until the next GitHub call is worth making."""
+    raw = (response.headers.get("Retry-After") or "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except ValueError:
+            pass
+    reset = (response.headers.get("X-RateLimit-Reset") or "").strip()
+    if reset:
+        try:
+            moment = time.time() if now is None else now
+            return max(1.0, float(reset) - moment)
+        except ValueError:
+            pass
+    return 60.0
 
 
 def retry_after_sec(response: requests.Response) -> float:
@@ -324,7 +375,10 @@ def adopted_names(
 
 
 def _host(url: str) -> str:
-    host = urlparse(url).netloc.lower()
+    try:
+        host = urlparse(url).netloc.lower()
+    except ValueError:
+        return ""
     if host.startswith("www."):
         host = host[4:]
     return host
@@ -373,8 +427,92 @@ def classify_provider(provider: str | None, url: str) -> str:
 SOURCE_PROVIDERS = frozenset({"devto", "github"})
 
 
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+_BARE_TELEGRAM = re.compile(
+    r"(?<![\w/])((?:t\.me|telegram\.me)/[A-Za-z0-9_]{1,32})\b",
+    re.IGNORECASE,
+)
+
+
+def _website_url(value: str | None) -> str:
+    text = (value or "").strip()
+    if not text or " " in text:
+        return ""
+    if text.startswith(("http://", "https://")):
+        return text
+    if "." not in text:
+        return ""
+    return "https://" + text.lstrip("/")
+
+
+def _same_link(url: str) -> str:
+    from core.db import social_url_key
+
+    return social_url_key(url)
+
+
+def links_from_text(text: str | None) -> list[dict[str, str]]:
+    """Known-site links written in a bio. A personal site or email is left out."""
+    raw = text or ""
+    found: list[str] = []
+    for match in _URL_IN_TEXT.findall(raw):
+        found.append(match.rstrip(".,;:!?)]}>\"'"))
+    for match in _BARE_TELEGRAM.findall(raw):
+        found.append("https://" + match)
+    links: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for url in found:
+        provider = classify_provider("", url)
+        if provider in SOURCE_PROVIDERS or provider == "generic":
+            continue
+        if provider == "x":
+            url = canonical_x_url(url)
+        key = _same_link(url)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        links.append({"provider": provider, "url": url, "status": "not_sent"})
+    return links
+
+
+def combine_social_links(
+    links: list[dict[str, str]] | None,
+    text: str | None,
+) -> list[dict[str, str]]:
+    """Add known contact links from README or bio text without duplicating a URL."""
+    merged = [dict(item) for item in links or []]
+    seen = {_same_link(str(item.get("url") or "")) for item in merged}
+    for item in links_from_text(text):
+        key = _same_link(item["url"])
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        merged.append(item)
+    return merged
+
+
+def readme_markdown(payload: object) -> str:
+    """Decode a GitHub README response. An empty file yields an empty string."""
+    if not isinstance(payload, dict):
+        return ""
+    content = payload.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return ""
+    try:
+        raw = base64.b64decode("".join(content.split()), validate=False)
+    except Exception:
+        return ""
+    text = raw.decode("utf-8", errors="replace")
+    if len(text) > 200_000:
+        return text[:200_000]
+    return text
+
+
 def build_social_links(profile: dict | None, accounts: list | None) -> list[dict[str, str]]:
-    """X from twitter_username, plus each social_accounts entry, one URL each."""
+    """X from twitter_username, plus each social_accounts entry, one URL each.
+
+    The bio and website field add a link only when it is a known contact site.
+    """
     links: list[dict[str, str]] = []
     seen: set[str] = set()
 
@@ -387,7 +525,7 @@ def build_social_links(profile: dict | None, accounts: list | None) -> list[dict
             url = canonical_x_url(url)
         if provider in SOURCE_PROVIDERS:
             return
-        key = url.lower().rstrip("/")
+        key = _same_link(url)
         if key in seen:
             return
         seen.add(key)
@@ -403,6 +541,14 @@ def build_social_links(profile: dict | None, accounts: list | None) -> list[dict
         if not isinstance(item, dict):
             continue
         add(str(item.get("provider") or ""), str(item.get("url") or ""))
+    if isinstance(profile, dict):
+        website = _website_url(str(profile.get("blog") or ""))
+        if website:
+            provider = classify_provider("", website)
+            if provider not in SOURCE_PROVIDERS and provider != "generic":
+                add(provider, website)
+        for item in links_from_text(str(profile.get("bio") or "")):
+            add(item["provider"], item["url"])
     return links
 
 
@@ -454,12 +600,17 @@ def fetch_json(
     session: requests.Session,
     path: str,
     *,
+    token: str | None = None,
     pause=None,
 ) -> tuple[str, object]:
-    """Return (ok|missing|failed, payload). pause(seconds, note) runs before a retry sleep."""
+    """Return (ok|missing|unauthorized|rate_limited|failed, payload).
+
+    pause(seconds, note) runs before a retry sleep. The token is the one
+    belonging to the scraper that asked for this lookup.
+    """
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            response = github_get(session, path)
+            response = github_get(session, path, token=token)
         except requests.RequestException as exc:
             wait = REQUEST_DELAY_SEC * attempt
             if pause:
@@ -470,7 +621,18 @@ def fetch_json(
             continue
         if response.status_code == 404:
             return "missing", None
-        if response.status_code == 429 or response.status_code >= 500:
+        if response.status_code == 401:
+            return "unauthorized", None
+        if response.status_code == 403 or response.status_code == 429:
+            remaining = (response.headers.get("X-RateLimit-Remaining") or "").strip()
+            body = ""
+            try:
+                body = response.text.lower()
+            except Exception:
+                body = ""
+            if response.status_code == 429 or remaining == "0" or "rate limit" in body:
+                return "rate_limited", rate_limit_wait(response)
+        if response.status_code >= 500:
             wait = retry_after_sec(response) if response.status_code == 429 else REQUEST_DELAY_SEC * attempt
             if pause:
                 pause(wait, f"retry in {wait:.0f}s")
@@ -487,10 +649,36 @@ def fetch_json(
     return "failed", None
 
 
+def fetch_profile_readme(
+    session: requests.Session,
+    username: str,
+    *,
+    token: str | None = None,
+    pause=None,
+) -> tuple[str, str, float]:
+    """Read the profile README. missing means that repo has no README.
+
+    Returns (ok|missing|unauthorized|rate_limited|failed, markdown, wait_seconds).
+    """
+    status, payload = fetch_json(
+        session,
+        readme_path(username),
+        token=token,
+        pause=pause,
+    )
+    if status == "ok":
+        return "ok", readme_markdown(payload), 0.0
+    if status == "rate_limited":
+        wait = payload if isinstance(payload, (int, float)) else 60.0
+        return "rate_limited", "", float(wait)
+    return status, "", 0.0
+
+
 def collect_profile(
     session: requests.Session,
     username: str,
     *,
+    token: str | None = None,
     pause=None,
     fetch_socials: bool = True,
 ) -> tuple[str, dict]:
@@ -499,7 +687,7 @@ def collect_profile(
     status is ok, missing, or failed. On ok, socials is None when the second
     call failed and the row should stay unmarked.
     """
-    status, payload = fetch_json(session, user_path(username), pause=pause)
+    status, payload = fetch_json(session, user_path(username), token=token, pause=pause)
     if status != "ok":
         return status, {}
     profile = payload if isinstance(payload, dict) else {}
@@ -509,6 +697,7 @@ def collect_profile(
         social_status, social_payload = fetch_json(
             session,
             social_accounts_path(username),
+            token=token,
             pause=pause,
         )
         if social_status == "failed":

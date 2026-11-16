@@ -1500,15 +1500,10 @@ class UnknownLocation(ValueError):
     """Non-empty text that does not name a country."""
 
 
-def place_decision(
-    location: str | None,
-    *,
-    suppressed_locations: set[str] | None = None,
-) -> dict[str, str]:
+def place_decision(location: str | None) -> dict[str, str]:
     """Turn free text into the stored place and what saving it should do.
 
-    ``action`` is ``save``, ``delete`` (country is on the exclusion list),
-    or ``suppress`` (this formatted place was marked by a suppressed user).
+    ``action`` is ``save``, or ``delete`` when the country is excluded.
     Blank text clears the place and keeps the user. Unrecognized text raises
     UnknownLocation.
     """
@@ -1523,13 +1518,6 @@ def place_decision(
         raise UnknownLocation("Unknown location")
     if is_skipped_country(country):
         return {"location": formatted, "country": country, "action": "delete"}
-    marks = {
-        item.casefold()
-        for item in (suppressed_locations or set())
-        if (item or "").strip()
-    }
-    if formatted.casefold() in marks:
-        return {"location": formatted, "country": country, "action": "suppress"}
     return {"location": formatted, "country": country, "action": "save"}
 
 
@@ -1592,22 +1580,16 @@ def _match_score(needle: str, location: str, keys: tuple[str, ...] | list[str]) 
 def suggest_places(
     query: str | None,
     *,
-    suppressed_locations: set[str] | None = None,
     stored: list[dict[str, str]] | None = None,
     limit: int = 12,
 ) -> list[dict[str, str]]:
     """Places matching typed or pasted text, best match first.
 
-    Each item is the formatted location plus ``save``, ``delete``, or ``suppress``.
+    Each item is the formatted location plus ``save`` or ``delete``.
     """
     needle = _plain(query or "")
     if len(needle) < 2:
         return []
-    marks = {
-        item.casefold()
-        for item in (suppressed_locations or set())
-        if (item or "").strip()
-    }
     hits: dict[str, dict[str, Any]] = {}
 
     def consider(location: str, country: str, score: int) -> None:
@@ -1619,12 +1601,7 @@ def suggest_places(
         current = hits.get(key)
         if current is not None and current["score"] <= score:
             return
-        if is_skipped_country(slug):
-            action = "delete"
-        elif key in marks:
-            action = "suppress"
-        else:
-            action = "save"
+        action = "delete" if is_skipped_country(slug) else "save"
         hits[key] = {
             "location": label,
             "country": slug,
@@ -1633,7 +1610,7 @@ def suggest_places(
         }
 
     try:
-        typed = place_decision(query, suppressed_locations=suppressed_locations)
+        typed = place_decision(query)
     except UnknownLocation:
         typed = None
     if typed and typed["location"]:

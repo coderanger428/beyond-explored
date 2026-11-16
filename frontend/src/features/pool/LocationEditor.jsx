@@ -2,11 +2,7 @@ import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { cls } from '../../styles/cls';
 import pool from '../../styles/pool.module.css';
 
-const locationEffectLabel = (action) => {
-  if (action === 'delete') return 'Excluded';
-  if (action === 'suppress') return 'Suppressed';
-  return '';
-};
+const locationEffectLabel = (action) => (action === 'delete' ? 'Excluded' : '');
 
 export const LocationEditor = ({ user, disabled = false, onCommit }) => {
   const inputRef = useRef(null);
@@ -90,7 +86,13 @@ export const LocationEditor = ({ user, disabled = false, onCommit }) => {
         setEditing(false);
         setDraftValue(next);
       })
-      .catch(() => {
+      .catch((err) => {
+        if (err?.name === 'AbortError') {
+          setEditing(false);
+          setOpen(false);
+          setDraftValue(currentLocation);
+          return;
+        }
         setDraftValue(next);
         setEditing(true);
       })
@@ -111,7 +113,7 @@ export const LocationEditor = ({ user, disabled = false, onCommit }) => {
   };
 
   return (
-    <div className={cls(pool, "location-editor")} title={String(user.github_bio || '').trim() || undefined}>
+    <div className={cls(pool, "location-editor")}>
       <input
         ref={inputRef}
         type="text"
@@ -192,9 +194,7 @@ export const LocationEditor = ({ user, disabled = false, onCommit }) => {
                 <span>{item.location}</span>
                 {effect ? (
                   <span
-                    className={cls(pool, item.action === 'delete'
-                        ? 'location-suggest-meta is-delete'
-                        : 'location-suggest-meta is-suppress')}
+                    className={cls(pool, 'location-suggest-meta is-delete')}
                   >
                     {effect}
                   </span>

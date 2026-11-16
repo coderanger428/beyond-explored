@@ -1,3 +1,4 @@
+import { IconHeart } from '../../components/Icons';
 import { SocialIcon } from '../../components/SocialIcon';
 import { UsersPagination } from '../../components/UsersPagination';
 import { LocationEditor } from './LocationEditor';
@@ -33,9 +34,9 @@ export function PoolView() {
     setEditingDisplayNameId,
     savingOutcomeIds,
     suppressingIds,
+    savingFavoriteIds,
     selectedSocials,
     searchQuery,
-    showUserTable,
     pageCount,
     sidebarCountries,
     sidebarTotal,
@@ -49,11 +50,16 @@ export function PoolView() {
     openSocialContact,
     handleOutcomeChange,
     handleSuppressUser,
+    handleToggleFavorite,
     handleExcludeCountry,
+    openUserDetail,
   } = useDashboard();
+  const poolLike = view === 'pool' || view === 'favorites';
+  const allSocialsOn = SOCIAL_ACCOUNT_FILTERS.every((item) => socialFilters[item.id]);
+  const someSocialsOn = SOCIAL_ACCOUNT_FILTERS.some((item) => socialFilters[item.id]);
   return (
     <>
-        {(view === 'pool' || view === 'tracked') && (
+        {(view === 'pool' || view === 'favorites' || view === 'tracked') && (
           <section className={cls(layout, "users-layout")}>
             <aside className={`${cls(ui, "card")} ${cls(layout, "countries-sidebar")}`}>
               <div className={cls(layout, "countries-sidebar-header")}>Countries</div>
@@ -77,7 +83,11 @@ export function PoolView() {
                 </button>
                 {sidebarCountries.length === 0 ? (
                   <div className={cls(layout, "countries-empty")}>
-                    {view === 'tracked' ? 'No sent mail yet' : 'No countries yet'}
+                    {view === 'tracked'
+                      ? 'No sent mail yet'
+                      : view === 'favorites'
+                        ? 'No favorite users yet'
+                        : 'No countries yet'}
                   </div>
                 ) : (
                   sidebarCountries.map((country) => {
@@ -108,10 +118,14 @@ export function PoolView() {
                               {formatCountryName(country.country)}
                             </span>
                             <span className={cls(layout, "country-list-count")}>
-                              {view === 'tracked' ? sent : `${sent}/${total}`}
+                              {view === 'tracked'
+                                ? sent
+                                : view === 'favorites'
+                                  ? Number(country.favorites) || 0
+                                  : `${sent}/${total}`}
                             </span>
                           </div>
-                          {view === 'tracked' ? null : (
+                          {view === 'tracked' || view === 'favorites' ? null : (
                           <div
                             className={cls(layout, "country-progress")}
                             role="progressbar"
@@ -155,8 +169,8 @@ export function PoolView() {
                       type="search"
                       placeholder={
                         selectedCountry
-                          ? 'Search name, email, link, GitHub or location'
-                          : 'Search all users by name, email or GitHub'
+                          ? 'Search name, email, @username, link, GitHub or location'
+                          : 'Search all users by name, email, @username or GitHub'
                       }
                       value={query}
                       onChange={(event) => {
@@ -165,9 +179,32 @@ export function PoolView() {
                       }}
                     />
                   </label>
-                  {view === 'pool' ? (
+                  {poolLike ? (
                     <fieldset className={cls(pool, "social-account-filters")}>
-                      <legend>Has account</legend>
+                      <legend>
+                        <span className={cls(pool, "social-account-legend")}>
+                          Has account
+                          <label className={cls(pool, allSocialsOn ? 'social-account-all is-on' : 'social-account-all')}>
+                            <input
+                              ref={(node) => {
+                                if (node) node.indeterminate = someSocialsOn && !allSocialsOn;
+                              }}
+                              type="checkbox"
+                              checked={allSocialsOn}
+                              onChange={() => {
+                                const next = !allSocialsOn;
+                                setSocialFilters(
+                                  Object.fromEntries(
+                                    SOCIAL_ACCOUNT_FILTERS.map((item) => [item.id, next]),
+                                  ),
+                                );
+                                setPage(1);
+                              }}
+                            />
+                            All
+                          </label>
+                        </span>
+                      </legend>
                       <div className={cls(pool, "social-account-filter-list")}>
                         {SOCIAL_ACCOUNT_FILTERS.map((item) => (
                           <label
@@ -204,27 +241,23 @@ export function PoolView() {
                             ? ` (${
                                 view === 'tracked'
                                   ? Number(selectedCountryMeta.sent) || 0
-                                  : selectedCountryMeta.count
+                                  : view === 'favorites'
+                                    ? Number(selectedCountryMeta.favorites) || 0
+                                    : selectedCountryMeta.count
                               })`
                             : ''
                         }`
                       : 'All countries'}
                   </div>
                   <div>
-                    <strong>Users found:</strong> {showUserTable ? total : 0}
+                    <strong>Users found:</strong> {total}
                   </div>
                 </div>
               </div>
 
               <div className={`${cls(ui, "card")} ${cls(pool, "table-card")}`}>
                 {error && <div className={cls(ui, "alert")}>{error}</div>}
-                {!showUserTable ? (
-                  <div className={cls(ui, "empty-state")}>
-                    {searchQuery
-                      ? 'Type at least 2 characters to search across all countries.'
-                      : 'Choose a country, or search all users by name or email.'}
-                  </div>
-                ) : loading ? (
+                {loading ? (
                   <div className={cls(ui, "empty-state")}>Loading users...</div>
                 ) : users.length === 0 ? (
                   <div className={cls(ui, "empty-state")}>
@@ -232,7 +265,9 @@ export function PoolView() {
                       ? 'No users match this search.'
                       : view === 'tracked'
                         ? 'No tracked users yet.'
-                        : 'No users.'}
+                        : view === 'favorites'
+                          ? 'No favorite users.'
+                          : 'No users.'}
                   </div>
                 ) : (
                   <>
@@ -246,21 +281,46 @@ export function PoolView() {
                       <table className={cls(pool, "users-table")}>
                         <thead>
                           <tr>
+                            {poolLike ? <th className={cls(pool, "favorite-cell")} /> : null}
                             <th>Source</th>
-                            {view === 'pool' ? <th>Social</th> : null}
+                            {poolLike ? <th>Social</th> : null}
                             <th>Name</th>
                             <th>Email</th>
-                            {view === 'pool' ? null : <th>Sender</th>}
+                            {poolLike ? null : <th>Sender</th>}
                             {!selectedCountry ? <th>Country</th> : null}
                             <th>Location</th>
-                            {view === 'pool' ? null : <th>Outcome</th>}
-                            {view === 'pool' ? null : <th>Updated</th>}
+                            {poolLike ? null : <th>Outcome</th>}
+                            {poolLike ? null : <th>Updated</th>}
                             <th className={cls(pool, "row-action-cell")} />
                           </tr>
                         </thead>
                         <tbody>
                           {users.map((user) => (
-                            <tr key={user.id}>
+                            <tr
+                              key={user.id}
+                              className={cls(pool, 'clickable-row')}
+                              onClick={(event) => {
+                                if (event.target.closest('button, a, input, select, textarea, label')) return;
+                                openUserDetail(user);
+                              }}
+                            >
+                              {poolLike ? (
+                                <td className={cls(pool, "favorite-cell")}>
+                                  <button
+                                    type="button"
+                                    className={cls(pool, user.favorite
+                                      ? 'favorite-button is-on'
+                                      : 'favorite-button')}
+                                    title={user.favorite ? 'Remove favorite' : 'Favorite'}
+                                    aria-label={user.favorite ? 'Remove favorite' : 'Favorite'}
+                                    aria-pressed={Boolean(user.favorite)}
+                                    disabled={savingFavoriteIds.has(user.id)}
+                                    onClick={() => handleToggleFavorite(user)}
+                                  >
+                                    <IconHeart filled={Boolean(user.favorite)} />
+                                  </button>
+                                </td>
+                              ) : null}
                               <td>
                                 {userSources(user).length ? (
                                   <span className={cls(pool, "source-links")}>
@@ -272,7 +332,7 @@ export function PoolView() {
                                   '-'
                                 )}
                               </td>
-                              {view === 'pool' ? (
+                              {poolLike ? (
                               <td>
                                 {socialItemsForUser(user).length ? (
                                   <span className={cls(pool, "social-links")}>
@@ -295,7 +355,7 @@ export function PoolView() {
                               </td>
                               ) : null}
                               <td className={cls(pool, "display-name-cell")}>
-                                {view === 'tracked' ? (
+                                {!poolLike ? (
                                   user.display_name || user.name || '-'
                                 ) : (
                                 <input
@@ -343,7 +403,7 @@ export function PoolView() {
                                   {user.email}
                                 </button>
                               </td>
-                              {view === 'pool' ? null : (
+                              {poolLike ? null : (
                                 <td title={user.sender_email || ''}>
                                   {user.sender_email || '-'}
                                 </td>
@@ -357,7 +417,7 @@ export function PoolView() {
                                   onCommit={handleSaveLocation}
                                 />
                               </td>
-                              {view === 'pool' ? null : (
+                              {poolLike ? null : (
                               <td className={cls(pool, "outcome-cell")}>
                                 <select
                                   className={cls(pool, "outcome-select")}
@@ -377,22 +437,31 @@ export function PoolView() {
                                 </select>
                               </td>
                               )}
-                              {view === 'pool' ? null : (
+                              {poolLike ? null : (
                               <td title={formatDate(user.updated_at)}>
                                 {formatUpdatedAgo(user.updated_at)}
                               </td>
                               )}
                               <td className={cls(pool, "row-action-cell")}>
-                                <button
-                                  type="button"
-                                  className={cls(pool, "suppress-button")}
-                                  title="Suppress"
-                                  aria-label="Suppress"
-                                  disabled={suppressingIds.has(user.id)}
-                                  onClick={() => handleSuppressUser(user)}
-                                >
-                                  <span className={cls(pool, "suppress-cross")} aria-hidden="true" />
-                                </button>
+                                <span className={cls(pool, "row-actions")}>
+                                  <button
+                                    type="button"
+                                    className={cls(pool, "edit-button")}
+                                    onClick={() => openUserDetail(user)}
+                                  >
+                                    Edit
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className={cls(pool, "suppress-button")}
+                                    title="Suppress"
+                                    aria-label="Suppress"
+                                    disabled={suppressingIds.has(user.id)}
+                                    onClick={() => handleSuppressUser(user)}
+                                  >
+                                    <span className={cls(pool, "suppress-cross")} aria-hidden="true" />
+                                  </button>
+                                </span>
                               </td>
                             </tr>
                           ))}

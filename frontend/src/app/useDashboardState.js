@@ -39,9 +39,18 @@ function chooseSender(senders, preferred, fallback) {
   return list[0] || '';
 }
 
+function searchText(value) {
+  const text = String(value || '').trim();
+  if (text.startsWith('@')) {
+    return text.replace(/^@+/, '').trim();
+  }
+  return text;
+}
+
 export function useDashboardState() {
   const [view, setView] = useState('pool');
   const [contactModal, setContactModal] = useState(null);
+  const [detailUser, setDetailUser] = useState(null);
   const [countries, setCountries] = useState([]);
   const [selectedCountry, setSelectedCountry] = useState('');
   const [query, setQuery] = useState('');
@@ -53,6 +62,8 @@ export function useDashboardState() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const mailPreviewSeq = useRef(0);
+  const usersRequestSeq = useRef(0);
+  const usersAbortRef = useRef(null);
   const lastSenderRef = useRef(readLastSender());
   const [mailAccounts, setMailAccounts] = useState(null);
   const [mailEmail, setMailEmail] = useState('');
@@ -68,6 +79,7 @@ export function useDashboardState() {
   const [savingDisplayNameIds, setSavingDisplayNameIds] = useState(() => new Set());
   const [editingDisplayNameId, setEditingDisplayNameId] = useState(null);
   const [savingOutcomeIds, setSavingOutcomeIds] = useState(() => new Set());
+  const [savingFavoriteIds, setSavingFavoriteIds] = useState(() => new Set());
   const [suppressingIds, setSuppressingIds] = useState(() => new Set());
   const [templates, setTemplates] = useState([]);
   const [templateCatalog, setTemplateCatalog] = useState({
@@ -77,6 +89,8 @@ export function useDashboardState() {
   });
   const [selectedTemplateRegion, setSelectedTemplateRegion] = useState('');
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
+  const [confirmPrompt, setConfirmPrompt] = useState(null);
+  const confirmResolveRef = useRef(null);
   const [templateSaveMode, setTemplateSaveMode] = useState('create');
   const [templateFilename, setTemplateFilename] = useState('');
   const [templateRegion, setTemplateRegion] = useState('etc');
@@ -92,7 +106,7 @@ export function useDashboardState() {
 
   const applyScraperInfo = (data) => {
     setScraperInfo(data);
-    if (!capDirty) {
+    if (!capDirty && data?.platform !== 'github') {
       const enabled = typeof data?.cap_enabled === 'boolean' ? data.cap_enabled : true;
       const cap =
         data?.daily_cap ??
@@ -106,7 +120,8 @@ export function useDashboardState() {
   };
 
   const loadScraperInfo = () => {
-    fetch('/api/scraper')
+    const platform = selectedScraper === 'github' ? '?platform=github' : '';
+    fetch(`/api/scraper${platform}`)
       .then(async (res) => {
         const data = await res.json();
         if (!res.ok) {
@@ -161,19 +176,19 @@ export function useDashboardState() {
   }, []);
 
   const selectedSocials =
-    view === 'pool'
+    view === 'pool' || view === 'favorites'
       ? SOCIAL_ACCOUNT_FILTERS.map((item) => item.id).filter((id) => socialFilters[id])
       : [];
 
   const fetchUsers = ({ silent = false } = {}) => {
-    const q = query.trim();
-    const searchAll = !selectedCountry && q.length >= 2;
-    if (!selectedCountry && !searchAll) {
-      setUsers([]);
-      setTotal(0);
-      return Promise.resolve();
+    const requestId = usersRequestSeq.current + 1;
+    usersRequestSeq.current = requestId;
+    if (usersAbortRef.current) {
+      usersAbortRef.current.abort();
     }
-
+    const controller = new AbortController();
+    usersAbortRef.current = controller;
+    const q = searchText(query);
     const params = new URLSearchParams();
     if (selectedCountry) {
       params.set('country', selectedCountry);
@@ -184,6 +199,9 @@ export function useDashboardState() {
     for (const provider of selectedSocials) {
       params.append('has_social', provider);
     }
+    if (view === 'favorites') {
+      params.set('favorite', '1');
+    }
     params.set('page', page);
     params.set('page_size', pageSize);
 
@@ -191,8 +209,8 @@ export function useDashboardState() {
       setLoading(true);
       setError('');
     }
-
-    return fetch(`/api/users?${params.toString()}`)
+    const current = () => requestId === usersRequestSeq.current;
+    return fetch(`/api/users?${params.toString()}`, { signal: controller.signal })
       .then((res) => {
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}`);
@@ -200,18 +218,19 @@ export function useDashboardState() {
         return res.json();
       })
       .then((data) => {
+        if (!current()) return;
         setUsers(data.users || []);
         setTotal(data.total || 0);
       })
       .catch((err) => {
+        if (err?.name === 'AbortError' || !current()) return;
         if (!silent) {
           setError(`Unable to load users: ${err.message}`);
         }
       })
       .finally(() => {
-        if (!silent) {
-          setLoading(false);
-        }
+        if (!current()) return;
+        setLoading(false);
       });
   };
 
@@ -229,7 +248,7 @@ export function useDashboardState() {
     if (view === 'templates') {
       loadTemplates();
     }
-  }, [view]);
+  }, [view, selectedScraper]);
 
   useEffect(() => {
     const poll = () => {
@@ -239,11 +258,9 @@ export function useDashboardState() {
       if (view === 'senders') {
         loadMailAccounts();
       }
-      if (view === 'pool' || view === 'tracked') {
+      if (view === 'pool' || view === 'favorites' || view === 'tracked') {
         loadCountries();
-        if (selectedCountry || query.trim().length >= 2) {
-          fetchUsers({ silent: true });
-        }
+        fetchUsers({ silent: true });
       }
       if (view === 'scraper') {
         loadScraperInfo();
@@ -264,30 +281,50 @@ export function useDashboardState() {
       window.clearInterval(intervalId);
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [view, selectedCountry, query, page, pageSize, capDirty, socialFilters]);
+  }, [view, selectedCountry, query, page, pageSize, capDirty, socialFilters, selectedScraper]);
 
-  const searchQuery = query.trim();
-  const isGlobalSearch = !selectedCountry && searchQuery.length >= 2;
-  const showUserTable = Boolean(selectedCountry) || isGlobalSearch;
+  const searchQuery = searchText(query);
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
   const mailAccountsData = mailAccounts || {};
   const accounts = mailAccountsData.accounts || [];
-  const sortedCountries = [...countries].sort(
-    (a, b) => (b.count || 0) - (a.count || 0) || String(a.country).localeCompare(String(b.country))
-  );
+  const byCount = (a, b) =>
+    (b.count || 0) - (a.count || 0) || String(a.country).localeCompare(String(b.country));
+  const pinNoloc = (items) => {
+    const top = items.filter((item) => item.country === 'noloc');
+    const rest = items.filter((item) => item.country !== 'noloc');
+    return [...top, ...rest];
+  };
+  const sortedCountries = pinNoloc([...countries].sort(byCount));
   const sidebarCountries =
     view === 'tracked'
-      ? sortedCountries
-          .filter((item) => (Number(item.sent) || 0) > 0)
-          .sort(
-            (a, b) =>
-              (Number(b.sent) || 0) - (Number(a.sent) || 0) ||
-              String(a.country).localeCompare(String(b.country))
+      ? pinNoloc(
+          sortedCountries
+            .filter((item) => (Number(item.sent) || 0) > 0)
+            .sort(
+              (a, b) =>
+                (Number(b.sent) || 0) - (Number(a.sent) || 0) ||
+                String(a.country).localeCompare(String(b.country))
+            )
+        )
+      : view === 'favorites'
+        ? pinNoloc(
+            sortedCountries
+              .filter((item) => (Number(item.favorites) || 0) > 0)
+              .sort(
+                (a, b) =>
+                  (Number(b.favorites) || 0) - (Number(a.favorites) || 0) ||
+                  String(a.country).localeCompare(String(b.country))
+              )
           )
-      : sortedCountries;
+        : sortedCountries;
   const sidebarTotal = sidebarCountries.reduce(
     (sum, item) =>
-      sum + (view === 'tracked' ? Number(item.sent) || 0 : Number(item.count) || 0),
+      sum +
+      (view === 'tracked'
+        ? Number(item.sent) || 0
+        : view === 'favorites'
+          ? Number(item.favorites) || 0
+          : Number(item.count) || 0),
     0
   );
   const selectedCountryMeta = sortedCountries.find(
@@ -489,10 +526,44 @@ export function useDashboardState() {
       });
   };
 
+  const askConfirm = (prompt) =>
+    new Promise((resolve) => {
+      confirmResolveRef.current = resolve;
+      setConfirmPrompt(prompt);
+    });
+
+  const closeConfirm = (accepted) => {
+    const resolve = confirmResolveRef.current;
+    confirmResolveRef.current = null;
+    setConfirmPrompt(null);
+    if (resolve) resolve(Boolean(accepted));
+  };
+
   const handleSaveLocation = (user, next) => {
     const name = String(user.display_name || user.name || user.email || 'this user').trim();
+    const text = String(next ?? '').trim();
     setError('');
-    return fetch(`/api/users/${user.id}`, {
+    const preview = text
+      ? fetch(`/api/locations/decide?q=${encodeURIComponent(text)}`).then(async (res) => {
+          if (!res.ok) return null;
+          return res.json();
+        }).catch(() => null)
+      : Promise.resolve(null);
+    return preview.then(async (decision) => {
+      if (decision?.action === 'delete') {
+        const countryName = formatCountryName(decision.country) || 'This country';
+        const accepted = await askConfirm({
+          title: `Exclude ${countryName}?`,
+          message: `${decision.location} is an excluded country. Saving it deletes ${name}.`,
+          confirmLabel: 'Exclude',
+        });
+        if (!accepted) {
+          const cancelled = new Error('cancelled');
+          cancelled.name = 'AbortError';
+          throw cancelled;
+        }
+      }
+      return fetch(`/api/users/${user.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ location: next }),
@@ -513,13 +584,7 @@ export function useDashboardState() {
           toast.success(`Deleted ${name}. ${place} is excluded.`);
           loadCountries();
           fetchUsers({ silent: true });
-          return;
-        }
-        if (action === 'suppress') {
-          toast.success(`Suppressed ${name}. ${place} is a suppressed location.`);
-          loadCountries();
-          fetchUsers({ silent: true });
-          return;
+          return data;
         }
         const saved = data.user || {};
         const leftCountry =
@@ -527,7 +592,7 @@ export function useDashboardState() {
         if (leftCountry) {
           loadCountries();
           fetchUsers({ silent: true });
-          return;
+          return data;
         }
         setUsers((list) =>
           list.map((row) => (row.id === user.id ? { ...row, ...saved } : row))
@@ -535,14 +600,113 @@ export function useDashboardState() {
         if (saved.country && saved.country !== user.country) {
           loadCountries();
         }
+        return data;
       })
       .catch((err) => {
+        if (err?.name === 'AbortError') throw err;
         const message = `Unable to save location: ${err.message}`;
         setError(message);
         toast.error(message);
         throw err;
       });
+    });
   };
+
+  const openUserDetail = (user) => {
+    setDetailUser(user);
+  };
+
+  const closeUserDetail = () => {
+    setDetailUser(null);
+  };
+
+  const rememberDetailUser = (saved) => {
+    if (!saved || saved.id == null) return;
+    setUsers((list) => list.map((row) => (row.id === saved.id ? { ...row, ...saved } : row)));
+    setDetailUser((current) => (current && current.id === saved.id ? { ...current, ...saved } : current));
+    handleCancelDisplayName(saved.id);
+  };
+
+  const saveDetailRequest = (user, url, method, body, label) => fetch(url, {
+    method,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  }).then(async (res) => {
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = payload.detail;
+      throw new Error(typeof detail === 'string' ? detail : `HTTP ${res.status}`);
+    }
+    return payload.user || null;
+  }).then((saved) => {
+    if (saved) rememberDetailUser(saved);
+    toast.success(label);
+    return saved;
+  }).catch((err) => {
+    toast.error(err.message || 'Unable to save.');
+    return null;
+  });
+
+  const saveDetailName = (user, value) => saveDetailRequest(
+    user,
+    `/api/users/${user.id}`,
+    'PATCH',
+    { display_name: value },
+    'Saved the name.',
+  );
+
+  const saveDetailEmail = (user, value) => saveDetailRequest(
+    user,
+    `/api/users/${user.id}/email`,
+    'PATCH',
+    { email: value },
+    'Saved the email.',
+  );
+
+  const saveDetailGithub = (user, value) => saveDetailRequest(
+    user,
+    `/api/users/${user.id}/github`,
+    'PATCH',
+    { github: value },
+    'Saved the GitHub username.',
+  );
+
+  const saveDetailLocation = (user, value) => handleSaveLocation(user, value).then((data) => {
+    if (!data) return null;
+    if (data.action === 'delete') return data;
+    const saved = data.user || {};
+    const leftCountry = selectedCountry && saved.country && saved.country !== selectedCountry;
+    if (!leftCountry && saved.id != null) rememberDetailUser(saved);
+    toast.success('Saved the location.');
+    return data;
+  }).catch((err) => {
+    if (err?.name === 'AbortError') throw err;
+    return null;
+  });
+
+  const saveDetailLink = (user, url) => saveDetailRequest(
+    user,
+    `/api/users/${user.id}/socials`,
+    'POST',
+    { url },
+    'Saved the link.',
+  );
+
+  const replaceDetailLink = (user, previous, url) => saveDetailRequest(
+    user,
+    `/api/users/${user.id}/socials`,
+    'PATCH',
+    { previous_url: previous, url },
+    'Saved the link.',
+  );
+
+  const removeDetailLink = (user, url) => saveDetailRequest(
+    user,
+    `/api/users/${user.id}/socials/remove`,
+    'POST',
+    { url },
+    'Removed the link.',
+  );
 
   const openEmailContact = (user) => {
     const seq = mailPreviewSeq.current + 1;
@@ -761,6 +925,46 @@ export function useDashboardState() {
       });
   };
 
+  const addTelegramLink = (username) => {
+    const user = contactModal?.user;
+    const handle = String(username || '').trim();
+    if (!user?.id || !handle) return;
+    setContactModal((current) => (current ? { ...current, saving: true } : current));
+    fetch(`/api/users/${user.id}/telegram`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: handle }),
+    })
+      .then(async (res) => {
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          const detail = body.detail;
+          throw new Error(typeof detail === 'string' ? detail : `HTTP ${res.status}`);
+        }
+        return body;
+      })
+      .then((data) => {
+        const saved = data.user || {};
+        setUsers((list) =>
+          list.map((row) => (row.id === user.id ? { ...row, ...saved } : row))
+        );
+        setContactModal((current) =>
+          current && current.user?.id === user.id
+            ? { ...current, saving: false, user: { ...current.user, ...saved } }
+            : current
+        );
+        toast.success(
+          data.added
+            ? `Telegram link added for @${handle}.`
+            : `Telegram link for @${handle} is already saved.`
+        );
+      })
+      .catch((err) => {
+        toast.error(`Unable to add Telegram: ${err.message}`);
+        setContactModal((current) => (current ? { ...current, saving: false } : current));
+      });
+  };
+
   const handleOutcomeChange = (user, value) => {
     const previous = user.outcome || 'Waiting';
     if (value === previous || savingOutcomeIds.has(user.id)) {
@@ -808,6 +1012,70 @@ export function useDashboardState() {
       })
       .finally(() => {
         setSavingOutcomeIds((currentIds) => {
+          const nextIds = new Set(currentIds);
+          nextIds.delete(user.id);
+          return nextIds;
+        });
+      });
+  };
+
+  const handleToggleFavorite = (user) => {
+    if (savingFavoriteIds.has(user.id)) {
+      return;
+    }
+    const next = user.favorite ? 0 : 1;
+    setSavingFavoriteIds((currentIds) => {
+      const nextIds = new Set(currentIds);
+      nextIds.add(user.id);
+      return nextIds;
+    });
+    setUsers((list) => {
+      if (view === 'favorites' && !next) {
+        return list.filter((row) => row.id !== user.id);
+      }
+      return list.map((row) => (row.id === user.id ? { ...row, favorite: next } : row));
+    });
+    if (view === 'favorites' && !next) {
+      setTotal((current) => Math.max(0, current - 1));
+    }
+    setCountries((list) =>
+      list.map((row) =>
+        row.country === user.country
+          ? {
+              ...row,
+              favorites: Math.max(0, (Number(row.favorites) || 0) + (next ? 1 : -1)),
+            }
+          : row
+      )
+    );
+    setError('');
+    fetch(`/api/users/${user.id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ favorite: Boolean(next) }),
+    })
+      .then((res) => {
+        if (!res.ok) {
+          return res.json().then((body) => {
+            const detail = body.detail;
+            const message = typeof detail === 'string' ? detail : `HTTP ${res.status}`;
+            throw new Error(message);
+          });
+        }
+        return res.json();
+      })
+      .then(() => {
+        loadCountries();
+      })
+      .catch((err) => {
+        const message = `Unable to save favorite: ${err.message}`;
+        setError(message);
+        toast.error(message);
+        loadCountries();
+        fetchUsers({ silent: true });
+      })
+      .finally(() => {
+        setSavingFavoriteIds((currentIds) => {
           const nextIds = new Set(currentIds);
           nextIds.delete(user.id);
           return nextIds;
@@ -869,7 +1137,7 @@ export function useDashboardState() {
     fetch('/api/scraper/pause', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ paused }),
+      body: JSON.stringify({ paused, platform: selectedScraper }),
     })
       .then(async (res) => {
         const data = await res.json();
@@ -1017,13 +1285,17 @@ export function useDashboardState() {
     const name = formatCountryName(slug);
     const total = Number(country.count) || 0;
     const noun = total === 1 ? 'user' : 'users';
-    if (
-      !window.confirm(
-        `Exclude ${name} permanently?\n\nThis deletes ${total} ${noun} from the database and stops scraping this country.`
-      )
-    ) {
-      return;
-    }
+    askConfirm({
+      title: `Exclude ${name}?`,
+      message: `This deletes ${total} ${noun} from the database and stops scraping this country.`,
+      confirmLabel: 'Exclude',
+    }).then((accepted) => {
+      if (!accepted) return;
+      excludeCountry(country, name, slug);
+    });
+  };
+
+  const excludeCountry = (country, name, slug) => {
     setLoading(true);
     setError('');
     fetch(`/api/countries/${encodeURIComponent(slug)}/exclude`, {
@@ -1101,6 +1373,16 @@ export function useDashboardState() {
     setView,
     contactModal,
     setContactModal,
+    detailUser,
+    openUserDetail,
+    closeUserDetail,
+    saveDetailName,
+    saveDetailEmail,
+    saveDetailLocation,
+    saveDetailGithub,
+    saveDetailLink,
+    replaceDetailLink,
+    removeDetailLink,
     countries,
     setCountries,
     selectedCountry,
@@ -1148,6 +1430,7 @@ export function useDashboardState() {
     setEditingDisplayNameId,
     savingOutcomeIds,
     setSavingOutcomeIds,
+    savingFavoriteIds,
     suppressingIds,
     setSuppressingIds,
     templates,
@@ -1176,8 +1459,6 @@ export function useDashboardState() {
     selectedSocials,
     fetchUsers,
     searchQuery,
-    isGlobalSearch,
-    showUserTable,
     pageCount,
     mailAccountsData,
     accounts,
@@ -1214,7 +1495,9 @@ export function useDashboardState() {
     openSocialContact,
     reloadMailPreview,
     saveContact,
+    addTelegramLink,
     handleOutcomeChange,
+    handleToggleFavorite,
     handleSuppressUser,
     handleScraperPause,
     handleSaveScrapeCap,
@@ -1223,6 +1506,8 @@ export function useDashboardState() {
     closeTemplateModal,
     handleSaveTemplate,
     handleExcludeCountry,
+    confirmPrompt,
+    closeConfirm,
     handleDeleteTemplate,
   };
 }

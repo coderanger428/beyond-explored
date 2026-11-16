@@ -1,6 +1,7 @@
 .summary-row {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
   margin-top: 16px;
@@ -29,6 +30,35 @@
   padding: 0;
   font-size: 0.95rem;
   color: #374151;
+}
+
+.social-account-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.social-account-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: #1f2937;
+  font-size: 0.88rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.social-account-all input {
+  margin: 0;
+  width: 14px;
+  height: 14px;
+  accent-color: #2563eb;
+  cursor: pointer;
+}
+
+.social-account-all.is-on {
+  color: #1d4ed8;
 }
 
 .social-account-filter-list {
@@ -204,6 +234,46 @@
   user-select: none;
 }
 
+.favorite-cell {
+  width: 40px;
+  padding-left: 8px;
+  padding-right: 4px;
+  text-align: center;
+  vertical-align: middle;
+}
+
+.favorite-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #9ca3af;
+  cursor: pointer;
+}
+
+.favorite-button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.favorite-button:hover:not(:disabled) {
+  color: #dc2626;
+}
+
+.favorite-button.is-on {
+  color: #dc2626;
+}
+
+.favorite-button:disabled {
+  cursor: default;
+}
+
 .users-table .select-cell input[type='checkbox'] {
   width: 16px;
   height: 16px;
@@ -298,10 +368,6 @@
 
 .location-suggest-meta.is-delete {
   color: #b91c1c;
-}
-
-.location-suggest-meta.is-suppress {
-  color: #b45309;
 }
 
 .outcome-cell {
@@ -399,4 +465,25 @@
   width: 1%;
   white-space: nowrap;
   text-align: right;
+}
+
+.row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.edit-button {
+  margin: 0;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: #eef2ff;
+  color: #1d4ed8;
+  font-size: 0.82rem;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.edit-button:hover:not(:disabled) {
+  background: #dbe4ff;
 }

@@ -1,17 +1,21 @@
 import { Toaster } from 'react-hot-toast';
-import { IconUsers, IconSettings, IconScraper, IconTemplates } from '../../components/Icons';
+import { IconUsers, IconSettings, IconScraper, IconTemplates, IconHeart } from '../../components/Icons';
 import { PoolView } from '../pool/PoolView';
 import { ScraperView } from '../scraper/ScraperView';
 import { SettingsView } from '../settings/SettingsView';
 import { TemplatesView } from '../templates/TemplatesView';
 import { ContactModal } from '../pool/ContactModal';
+import { ConfirmModal } from '../pool/ConfirmModal';
+import { UserDetailModal } from '../pool/UserDetailModal';
 import { useDashboard } from '../../app/DashboardContext';
 import { cls } from '../../styles/cls';
 import shell from '../../styles/shell.module.css';
+import logo from '../../assets/logo.png';
 
 const NAV_ITEMS = [
   { id: 'scraper', label: 'Scraper', Icon: IconScraper },
   { id: 'pool', label: 'Pool', Icon: IconUsers },
+  { id: 'favorites', label: 'Favorites', Icon: IconHeart },
   { id: 'templates', label: 'Templates', Icon: IconTemplates },
   { id: 'senders', label: 'Settings', Icon: IconSettings },
 ];
@@ -52,12 +56,11 @@ export function Shell() {
             type="button"
             className={cls(shell, "topbar-brand")}
             onClick={() => setView('pool')}
+            aria-label="Beyond Explored"
           >
-            <span className={cls(shell, "topbar-brand-mark")} aria-hidden="true">
-              M
-            </span>
+            <img className={cls(shell, "topbar-brand-mark")} src={logo} alt="" />
             <span className="topbar-brand-text">
-              <span className={cls(shell, "topbar-title")}>Mail Dashboard</span>
+              <span className={cls(shell, "topbar-title")}>Beyond Explored</span>
             </span>
           </button>
           <nav className={cls(shell, "nav-bar")} aria-label="Main">
@@ -67,7 +70,7 @@ export function Shell() {
                 type="button"
                 className={cls(shell, view === id ? 'nav-button active' : 'nav-button')}
                 onClick={() => {
-                  if (id !== view && id === 'pool') {
+                  if (id !== view && (id === 'pool' || id === 'favorites')) {
                     setPage(1);
                   }
                   setView(id);
@@ -87,6 +90,8 @@ export function Shell() {
         <TemplatesView />
         <SettingsView />
         <ContactModal />
+        <UserDetailModal />
+        <ConfirmModal />
         <button
           type="button"
           className={cls(shell, 'go-top-bubble')}
