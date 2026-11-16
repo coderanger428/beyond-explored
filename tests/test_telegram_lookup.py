@@ -78,19 +78,29 @@ class TelegramCheckTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_existing_account_stays_untouched(self):
+    def test_existing_account_adds_a_telegram_link(self):
         conn = _conn()
         try:
             user_id = _user(
                 conn,
                 "ada@example.com",
-                '[{"provider":"x","url":"https://x.com/ada_name","status":"not_sent"}]',
+                '[{"provider":"x","url":"https://x.com/ada_name","status":"not_sent"},'
+                '{"provider":"instagram","url":"https://instagram.com/ada_name","status":"not_sent"},'
+                '{"provider":"reddit","url":"https://reddit.com/user/ada_other","status":"not_sent"}]',
             )
-            result = check_telegram_handles(conn, [user_id], lambda handle: "exists")
-            self.assertEqual(result["found"], 1)
-            self.assertEqual(result["failed"], 0)
-            self.assertEqual(_statuses(conn, user_id)["https://x.com/ada_name"], "not_sent")
-            self.assertEqual(result["users"], [])
+            result = check_telegram_handles(
+                conn,
+                [user_id],
+                lambda handle: "exists" if handle == "ada_name" else "missing",
+            )
+            self.assertEqual(result["found"], 2)
+            self.assertEqual(result["failed"], 1)
+            statuses = _statuses(conn, user_id)
+            self.assertEqual(statuses["https://x.com/ada_name"], "not_sent")
+            self.assertEqual(statuses["https://instagram.com/ada_name"], "not_sent")
+            self.assertEqual(statuses["https://t.me/ada_name"], "not_sent")
+            self.assertEqual(statuses["https://reddit.com/user/ada_other"], "failed")
+            self.assertNotIn("https://t.me/ada_other", statuses)
         finally:
             conn.close()
 

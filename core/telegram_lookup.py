@@ -1,7 +1,8 @@
 """Public Telegram username check for social handles already stored on a user.
 
 t.me/{username} shows a public account, bot, channel, or group when one exists.
-A missing name is the generic contact page. This is an exact username lookup.
+A name that exists is stored as https://t.me/{username}. A missing name is the
+generic contact page and marks that social link failed. This is an exact username lookup.
 """
 
 from __future__ import annotations
@@ -198,6 +199,25 @@ def resolve_telegram_candidates(
     }
 
 
+def apply_telegram_matches(conn, decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Store https://t.me/{handle} when that exact name exists."""
+    users: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    for item in decisions:
+        if item.get("state") != "exists":
+            continue
+        user_id = int(item["user_id"])
+        handle = str(item["handle"])
+        key = (user_id, handle.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        saved, added = app_db.add_telegram_link(conn, user_id, handle)
+        if saved is not None and added:
+            users.append(saved)
+    return users
+
+
 def apply_telegram_failures(conn, decisions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Write failed onto links whose Telegram name is missing."""
     by_user: dict[int, list[str]] = {}
@@ -226,17 +246,22 @@ def check_telegram_handles(
     user_ids: list[int],
     lookup: Lookup,
 ) -> dict[str, Any]:
-    """Mark not-sent username links failed when that exact Telegram name is missing.
+    """Add a Telegram link when that exact name exists, and mark a missing name failed.
 
     A user who already has a Telegram link is left alone. Sent links stay sent.
-    Unknown answers are not marked failed.
+    Unknown answers are not marked failed and do not add a link.
     """
     resolved = resolve_telegram_candidates(telegram_candidates(conn, user_ids), lookup)
-    users = apply_telegram_failures(conn, resolved["decisions"])
+    added = apply_telegram_matches(conn, resolved["decisions"])
+    failed = apply_telegram_failures(conn, resolved["decisions"])
+    by_id = {int(user["id"]): user for user in added if user and user.get("id") is not None}
+    for user in failed:
+        if user and user.get("id") is not None:
+            by_id[int(user["id"])] = user
     return {
         "checked": resolved["checked"],
         "failed": resolved["failed"],
         "found": resolved["found"],
         "unknown": resolved["unknown"],
-        "users": users,
+        "users": list(by_id.values()),
     }
